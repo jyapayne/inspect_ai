@@ -26,7 +26,7 @@ export function isLargeSample(sample: EvalSample): boolean {
     return true;
   }
 
-  return true;
+  return false;
 }
 
 function countKeys(obj: unknown, options = { countArrayIndices: false }) {

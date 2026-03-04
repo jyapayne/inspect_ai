@@ -95,15 +95,19 @@ export const SampleDetailComponent: FC<SampleDetailComponentProps> = ({
 
   // Check if the loaded sample matches the requested sample from URL params
   // This prevents showing old sample data while a new sample is loading
-  // When sample is null but we have sampleId/epoch, it's a running sample —
-  // allow rendering so the downstream SampleDisplay can show runningEvents
+  // When sample is null, check whether we have running events to display —
+  // only allow rendering if there's actually something to show
+  const runningEvents = useStore((state) => state.sample.runningEvents);
   const sampleMatchesRequest = useMemo(() => {
     if (!sampleId || !epoch) return false;
-    if (!sample) return true; // running sample: render via runningEvents path
+    if (!sample) {
+      // Only render without a sample if we have running events to display
+      return runningEvents.length > 0;
+    }
     return (
       String(sample.id) === sampleId && sample.epoch === parseInt(epoch, 10)
     );
-  }, [sample, sampleId, epoch]);
+  }, [sample, sampleId, epoch, runningEvents]);
 
   // Find functionality
   const showFind = useStore((state) => state.app.showFind);
