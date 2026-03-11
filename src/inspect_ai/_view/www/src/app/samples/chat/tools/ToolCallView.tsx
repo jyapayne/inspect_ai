@@ -11,6 +11,7 @@ import {
 } from "../../../../@types/log";
 import { ContentTool } from "../../../../app/types";
 import ExpandablePanel from "../../../../components/ExpandablePanel";
+import { NavPills } from "../../../../components/NavPills";
 import { MessageContent } from "../MessageContent";
 import { defaultContext } from "../MessageContents";
 import styles from "./ToolCallView.module.css";
@@ -22,7 +23,16 @@ interface ToolCallViewProps {
   id: string;
   functionCall: string;
   input?: unknown;
-  precedingBrowserAction?: Record<string, unknown>;
+  /** Annotation derived from this visual action's own arguments. */
+  selfAnnotation?: ToolAnnotation;
+  /** Normalized content from the preceding screenshot (for the Input tab). */
+  inputScreenshot?: (
+    | ContentText
+    | ContentImage
+    | ContentAudio
+    | ContentVideo
+    | ContentTool
+  )[];
   description?: string;
   contentType?: string;
   view?: ToolCallContent;
@@ -57,7 +67,8 @@ export const ToolCallView: FC<ToolCallViewProps> = ({
   id,
   functionCall,
   input,
-  precedingBrowserAction,
+  selfAnnotation,
+  inputScreenshot,
   description,
   contentType,
   view,
@@ -119,24 +130,29 @@ export const ToolCallView: FC<ToolCallViewProps> = ({
   const contents = mode !== "compact" ? input : input || functionCall;
   const context = defaultContext("tool");
 
-  const annotation = useMemo<ToolAnnotation | undefined>(() => {
-    // For screenshot tool calls, use the preceding browser action's arguments
-    // to determine what annotation to show. The pattern is:
-    //   browser(left_click, coord=[x,y]) → text response
-    //   browser(screenshot) → image response ← annotate THIS with click info
-    if (precedingBrowserAction) {
-      const action = precedingBrowserAction.action as string | undefined;
-      if (action) {
-        return {
-          action,
-          coordinate: precedingBrowserAction.coordinate as [number, number] | undefined,
-          text: precedingBrowserAction.text as string | undefined,
-          scrollDirection: precedingBrowserAction.scroll_direction as string | undefined,
-        };
-      }
-    }
-    return undefined;
-  }, [precedingBrowserAction]);
+  // Build the output rendering (Result tab or standalone)
+  const outputElement =
+    hasContent && collapsible ? (
+      <ExpandablePanel
+        id={`${id}-tool-input`}
+        collapse={collapse}
+        border={true}
+        lines={15}
+        className={clsx("text-size-small")}
+      >
+        <MessageContent contents={normalizedContent} context={context} />
+      </ExpandablePanel>
+    ) : (
+      <MessageContent contents={normalizedContent} context={context} />
+    );
+
+  // Build the input screenshot rendering (Input tab)
+  const inputElement =
+    selfAnnotation && inputScreenshot ? (
+      <AnnotatedToolOutput annotation={selfAnnotation}>
+        <MessageContent contents={inputScreenshot} context={context} />
+      </AnnotatedToolOutput>
+    ) : null;
 
   return (
     <div className={clsx(styles.toolCallView)}>
@@ -155,29 +171,20 @@ export const ToolCallView: FC<ToolCallViewProps> = ({
           toolCallView={view}
         />
       </div>
-      {hasContent && collapsible ? (
-        <ExpandablePanel
-          id={`${id}-tool-input`}
-          collapse={collapse}
-          border={true}
-          lines={15}
-          className={clsx("text-size-small")}
-        >
-          <AnnotatedToolOutput annotation={annotation}>
-            <MessageContent contents={normalizedContent} context={context} />
-          </AnnotatedToolOutput>
-        </ExpandablePanel>
+      {inputElement ? (
+        <NavPills id={`${id}-browser-action`}>
+          <div title="Input">{inputElement}</div>
+          <div title="Result">{outputElement}</div>
+        </NavPills>
       ) : (
-        <AnnotatedToolOutput annotation={annotation}>
-          <MessageContent contents={normalizedContent} context={context} />
-        </AnnotatedToolOutput>
+        outputElement
       )}
     </div>
   );
 };
 
 /**
- * Renders the ToolCallView component.
+ * Normalize tool output into a flat content array for MessageContent.
  */
 const normalizeContent = (
   output:

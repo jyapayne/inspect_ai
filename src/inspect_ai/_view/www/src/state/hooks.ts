@@ -217,6 +217,7 @@ export const useSampleData = () => {
     (state) => state.sample.sample_identifier,
   );
   const sampleNeedsReload = useStore((state) => state.sample.sampleNeedsReload);
+  const eventsCleared = useStore((state) => state.sample.eventsCleared);
   const runningEvents = useStore(
     (state) => state.sample.runningEvents,
   ) as Events;
@@ -227,6 +228,7 @@ export const useSampleData = () => {
       sampleNeedsReload,
       error: sampleError,
       getSelectedSample,
+      eventsCleared,
       running: runningEvents,
     };
   }, [
@@ -235,6 +237,7 @@ export const useSampleData = () => {
     getSelectedSample,
     selectedSampleIdentifier,
     sampleNeedsReload,
+    eventsCleared,
     runningEvents,
   ]);
 };

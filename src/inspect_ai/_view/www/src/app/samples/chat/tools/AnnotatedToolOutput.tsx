@@ -65,6 +65,7 @@ export const AnnotatedToolOutput: React.FC<AnnotatedToolOutputProps> = ({
 
     const resizeObs = new ResizeObserver(updateImageInfos);
     resizeObserverRef.current = resizeObs;
+    const observedImages = observedImagesRef.current;
 
     const trackImage = (img: HTMLImageElement) => {
       if (observedImagesRef.current.has(img)) return;
@@ -77,10 +78,17 @@ export const AnnotatedToolOutput: React.FC<AnnotatedToolOutputProps> = ({
       }
     };
 
+    const untrackImage = (img: HTMLImageElement) => {
+      if (!observedImagesRef.current.has(img)) return;
+      observedImagesRef.current.delete(img);
+      resizeObs.unobserve(img);
+      img.removeEventListener("load", updateImageInfos);
+    };
+
     // Track any existing images
     container.querySelectorAll("img").forEach(trackImage);
 
-    // Watch for images added later (e.g. after expand, lazy load)
+    // Watch for images added/removed (e.g. after expand/collapse, lazy load)
     const mutationObs = new MutationObserver((mutations) => {
       for (const mutation of mutations) {
         for (const node of Array.from(mutation.addedNodes)) {
@@ -90,7 +98,15 @@ export const AnnotatedToolOutput: React.FC<AnnotatedToolOutputProps> = ({
             node.querySelectorAll("img").forEach(trackImage);
           }
         }
+        for (const node of Array.from(mutation.removedNodes)) {
+          if (node instanceof HTMLImageElement) {
+            untrackImage(node);
+          } else if (node instanceof HTMLElement) {
+            node.querySelectorAll("img").forEach(untrackImage);
+          }
+        }
       }
+      updateImageInfos();
     });
     mutationObs.observe(container, { childList: true, subtree: true });
 
@@ -100,10 +116,10 @@ export const AnnotatedToolOutput: React.FC<AnnotatedToolOutputProps> = ({
     return () => {
       resizeObs.disconnect();
       mutationObs.disconnect();
-      for (const img of observedImagesRef.current) {
+      for (const img of observedImages) {
         img.removeEventListener("load", updateImageInfos);
       }
-      observedImagesRef.current.clear();
+      observedImages.clear();
       resizeObserverRef.current = null;
     };
   }, [annotation, updateImageInfos]);
@@ -150,14 +166,18 @@ export const AnnotatedToolOutput: React.FC<AnnotatedToolOutputProps> = ({
 function renderSvgAnnotation(
   annotation: ToolAnnotation,
   scaleX: number,
-  scaleY: number
+  scaleY: number,
 ) {
   const { action, coordinate } = annotation;
 
   if (
-    ["left_click", "right_click", "middle_click", "double_click", "triple_click"].includes(
-      action
-    ) &&
+    [
+      "left_click",
+      "right_click",
+      "middle_click",
+      "double_click",
+      "triple_click",
+    ].includes(action) &&
     coordinate
   ) {
     const [x, y] = coordinate;
@@ -195,7 +215,7 @@ function renderSvgAnnotation(
     const [x, y] = coordinate;
     const scaledX = x * scaleX;
     const scaledY = y * scaleY;
-    
+
     let arrow = "↕";
     if (annotation.scrollDirection) {
       const dir = annotation.scrollDirection.toLowerCase();
@@ -232,13 +252,13 @@ function renderHtmlAnnotation(annotation: ToolAnnotation) {
   if (action === "type" || action === "key") {
     const isType = action === "type";
     const color = isType ? "#4ade80" : "#fbbf24";
-    
+
     // For type/key annotations:
     // - Positioned at bottom of image (not at coordinates)
     // - Styled badges: type=green (#4ade80), key=amber (#fbbf24)
     // - Black background, monospace font, rounded corners
     // - Prefixed with ⌨ character
-    
+
     // If it's a key action, it might be positioned at bottom-right
     // If it's a type action, it might be positioned at bottom-center
     const isKey = action === "key";

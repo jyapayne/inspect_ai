@@ -158,7 +158,7 @@ from inspect_ai.tool._tool_info import ToolInfo
 
 from ._providers._openai_computer_use import (
     computer_call_output,
-    maybe_computer_use_preview_tool,
+    maybe_computer_use_tool,
     tool_call_from_openai_computer_tool_call,
 )
 from ._providers._openai_web_search import maybe_web_search_tool
@@ -179,7 +179,6 @@ class ResponsesModelInfo(Protocol):
     def is_o1_early(self) -> bool: ...
     def is_o3_mini(self) -> bool: ...
     def is_deep_research(self) -> bool: ...
-    def is_computer_use_preview(self) -> bool: ...
     def is_codex(self) -> bool: ...
 
 
@@ -413,9 +412,9 @@ def openai_responses_tool_choice(
             return "required"
         case _:
             return (
-                ToolChoiceTypesParam(type="computer_use_preview")
+                ToolChoiceTypesParam(type="computer")
                 if tool_choice.name == "computer"
-                and any(tool["type"] == "computer_use_preview" for tool in tools)
+                and any(tool["type"] == "computer" for tool in tools)
                 else ToolChoiceTypesParam(type="web_search_preview")
                 if tool_choice.name == "web_search"
                 and any(tool["type"] == "web_search" for tool in tools)
@@ -637,7 +636,8 @@ def _process_response_output_items(
                 has_tool_calls = True
                 if output.id is not None:
                     assistant_internal().tool_calls[output.call_id] = cast(
-                        ResponseFunctionToolCallParam, output.model_dump()
+                        ResponseFunctionToolCallParam,
+                        output.model_dump(exclude_none=True),
                     )
 
                 tool_calls.append(
@@ -666,7 +666,8 @@ def _process_response_output_items(
                 has_tool_calls = True
                 if output.id is not None:
                     assistant_internal().tool_calls[output.call_id] = cast(
-                        ResponseComputerToolCallParam, output.model_dump()
+                        ResponseComputerToolCallParam,
+                        output.model_dump(exclude_none=True),
                     )
 
                 if output.pending_safety_checks:
@@ -850,11 +851,19 @@ mcp_tool_adapter = TypeAdapter(list[McpListToolsToolParam])
 
 
 def web_search_to_tool_use(output: ResponseFunctionWebSearch) -> ContentToolUse:
+    if output.action is None:
+        # Preserve web_search_call items that omit action.
+        action_name = "search"
+        action_arguments = to_json_str_safe({"type": "search", "query": ""})
+    else:
+        action_name = output.action.type
+        action_arguments = output.action.to_json(exclude_none=True)
+
     return ContentToolUse(
         tool_type="web_search",
         id=output.id,
-        name=output.action.type,
-        arguments=output.action.to_json(exclude_none=True),
+        name=action_name,
+        arguments=action_arguments,
         result="",
         error="failed" if output.status == "failed" else None,
     )
@@ -1146,7 +1155,7 @@ def _maybe_native_tool_param(
 ) -> ToolParam | None:
     return (
         (
-            maybe_computer_use_preview_tool(model_name, tool)
+            maybe_computer_use_tool(model_name, tool)
             or maybe_web_search_tool(model_name, tool)
             or maybe_mcp_tool(tool)
             or maybe_code_interpreter_tool(model_name, tool)
@@ -1469,7 +1478,7 @@ def is_mcp_tool_param(tool_param: ToolParam) -> TypeGuard[Mcp]:
 
 
 def is_computer_tool_param(tool_param: ToolParam) -> TypeGuard[ComputerToolParam]:
-    return tool_param.get("type") == "computer_use_preview"
+    return tool_param.get("type") == "computer"
 
 
 def is_custom_tool_param(tool_param: ToolParam) -> TypeGuard[CustomToolParam]:

@@ -74,7 +74,7 @@ export default defineConfig(({ mode }) => {
         },
         cssCodeSplit: false,
         sourcemap: true,
-        minify: false,
+        minify: true,
       },
     };
   } else {

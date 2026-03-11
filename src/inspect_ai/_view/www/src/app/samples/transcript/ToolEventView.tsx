@@ -22,7 +22,6 @@ interface ToolEventViewProps {
   children: EventNode<EventType>[];
   className?: string | string[];
   context?: EventNodeContext;
-  precedingBrowserAction?: Record<string, unknown>;
 }
 
 /**
@@ -33,7 +32,6 @@ export const ToolEventView: FC<ToolEventViewProps> = ({
   children,
   className,
   context,
-  precedingBrowserAction,
 }) => {
   const event = eventNode.event;
 
@@ -46,8 +44,6 @@ export const ToolEventView: FC<ToolEventViewProps> = ({
     () => resolveToolInput(event.function, event.arguments),
     [event.function, event.arguments],
   );
-
-
 
   const { approvalNode, lastModelNode } = useMemo(() => {
     const approvalNode = children.find((e) => {
@@ -83,7 +79,8 @@ export const ToolEventView: FC<ToolEventViewProps> = ({
           id={`${eventNode.id}-tool-call`}
           functionCall={functionCall}
           input={input}
-          precedingBrowserAction={precedingBrowserAction}
+          selfAnnotation={context?.selfAnnotation}
+          inputScreenshot={context?.inputScreenshot}
           description={description}
           contentType={contentType}
           output={event.error?.message || event.result}

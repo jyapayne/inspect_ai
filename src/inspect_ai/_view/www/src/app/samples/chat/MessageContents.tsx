@@ -3,10 +3,17 @@ import {
   ChatMessageSystem,
   ChatMessageTool,
   ChatMessageUser,
+  ContentImage,
+  ContentText,
 } from "../../../@types/log";
 import { MessageContent } from "./MessageContent";
 import { resolveToolInput, substituteToolCallContent } from "./tools/tool";
 import { ToolCallView } from "./tools/ToolCallView";
+import {
+  buildSelfAnnotation,
+  BROWSER_TOOL_FUNCTIONS,
+  isBrowserScreenshot,
+} from "./tools/browserActionUtils";
 
 import clsx from "clsx";
 import { FC, Fragment } from "react";
@@ -72,32 +79,13 @@ export const MessageContents: FC<MessageContentsProps> = ({
       // Resolve the tool output
       const resolvedToolOutput = resolveToolMessage(toolMessage);
 
-      // For screenshot tool calls, look FORWARD to find the next visual
-      // browser action (click/scroll/type). The annotation shows what is
-      // ABOUT TO happen on this screen. Skip non-visual actions like
-      // get_page_text that don't have coordinates.
-      const visualActions = new Set([
-        "left_click", "right_click", "middle_click", "double_click", "triple_click",
-        "scroll", "type", "key",
-      ]);
-      let precedingAction: Record<string, unknown> | undefined;
-      if (
-        tool_call.function === "browser" &&
-        (tool_call.arguments as Record<string, unknown>)?.action === "screenshot"
-      ) {
-        for (let j = idx + 1; j < allToolCalls.length; j++) {
-          const nextCall = allToolCalls[j];
-          if (nextCall.function !== "browser") break;
-          const nextArgs = nextCall.arguments as Record<string, unknown>;
-          const nextAction = nextArgs?.action as string | undefined;
-          if (nextAction === "screenshot" || nextAction === "navigate") break;
-          if (nextAction && visualActions.has(nextAction)) {
-            precedingAction = nextArgs;
-            break;
-          }
-          // non-visual (get_page_text, etc.) — keep searching
-        }
-      }
+      // For visual browser actions (click/scroll/type), find the preceding
+      // screenshot tool call to show as the "Input" tab with annotation overlay.
+      const toolArgs = tool_call.arguments as Record<string, unknown>;
+      const selfAnnotation = buildSelfAnnotation(tool_call.function, toolArgs);
+      const inputScreenshot = selfAnnotation
+        ? findPrecedingScreenshotOutput(allToolCalls, toolMessages, idx)
+        : undefined;
 
       if (toolCallStyle === "compact") {
         return (
@@ -116,7 +104,8 @@ export const MessageContents: FC<MessageContentsProps> = ({
             key={`tool-call-${idx}`}
             functionCall={functionCall}
             input={input}
-            precedingBrowserAction={precedingAction}
+            selfAnnotation={selfAnnotation}
+            inputScreenshot={inputScreenshot}
             description={description}
             contentType={contentType}
             output={resolvedToolOutput}
@@ -210,4 +199,49 @@ const resolveToolMessage = (toolMessage?: ChatMessageTool): ContentTool[] => {
       .filter((con) => con !== undefined);
     return result;
   }
+};
+
+/**
+ * Walk backward from the current tool call index to find the preceding
+ * browser screenshot and return its output as normalized content.
+ * Used to populate the "Input" tab on visual browser actions.
+ */
+const findPrecedingScreenshotOutput = (
+  allToolCalls: ReadonlyArray<{
+    id?: string;
+    function: string;
+    arguments: unknown;
+  }>,
+  toolMessages: ChatMessageTool[],
+  currentIndex: number,
+): (ContentText | ContentImage)[] | undefined => {
+  for (let j = currentIndex - 1; j >= 0; j--) {
+    const prevCall = allToolCalls[j];
+    if (!BROWSER_TOOL_FUNCTIONS.has(prevCall.function)) break;
+    const prevArgs = prevCall.arguments as Record<string, unknown>;
+    if (isBrowserScreenshot(prevCall.function, prevArgs)) {
+      // Found the preceding screenshot — get its tool message output.
+      let prevToolMsg: ChatMessageTool | undefined;
+      if (prevCall.id) {
+        prevToolMsg = toolMessages.find(
+          (msg) => msg.tool_call_id === prevCall.id,
+        );
+      } else {
+        prevToolMsg = toolMessages[j];
+      }
+      if (!prevToolMsg) return undefined;
+      const resolved = resolveToolMessage(prevToolMsg);
+      // Extract image content from the resolved ContentTool wrappers.
+      const images: (ContentText | ContentImage)[] = [];
+      for (const ct of resolved) {
+        for (const item of ct.content) {
+          if (item.type === "image" || item.type === "text") {
+            images.push(item);
+          }
+        }
+      }
+      return images.length > 0 ? images : undefined;
+    }
+  }
+  return undefined;
 };
