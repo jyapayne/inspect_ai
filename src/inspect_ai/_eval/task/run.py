@@ -289,6 +289,10 @@ async def task_run(options: TaskRunOptions) -> EvalLog:
         # that the log is initialized)
         await log_start(logger, plan, generate_config)
 
+        # notify the view module that an eval has started so the viewer
+        # can discover the log file and begin polling for live samples
+        view_notify_eval(logger.location)
+
         try:
             # return immediately if we are not running samples
             if not options.run_samples:
