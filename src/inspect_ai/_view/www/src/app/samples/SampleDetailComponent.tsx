@@ -235,6 +235,7 @@ export const SampleDetailComponent: FC<SampleDetailComponentProps> = ({
 
         {sampleMatchesRequest && (
           <InlineSampleComponent
+            key={`${sampleId}-${epoch}`}
             showActivity={
               sampleStatus === "loading" || sampleStatus === "streaming"
             }

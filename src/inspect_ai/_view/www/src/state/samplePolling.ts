@@ -226,8 +226,11 @@ export function createSamplePolling(
     polling.start();
   };
 
-  // Stop polling
+  // Stop polling and abort any in-flight requests
   const stopPolling = () => {
+    if (abortController) {
+      abortController.abort();
+    }
     if (currentPolling) {
       currentPolling.stop();
       currentPolling = null;
