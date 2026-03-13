@@ -184,6 +184,10 @@ export const createLogSlice = (
         const state = get();
         const api = state.api;
 
+        // Clear any previous sample state so stale data doesn't
+        // persist when navigating between logs
+        state.sampleActions.clearSelectedSample();
+
         // Ensure there is a log dir
         let logDir = state.logs.logDir;
         if (state.logs.logDir === undefined) {
