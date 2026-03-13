@@ -263,7 +263,16 @@ export const createLogSlice = (
           logPolling.startPolling(logFileName);
         } catch (error) {
           log.error("Error loading log:", error);
-          throw error;
+
+          // The .eval file may not be readable yet during a running eval
+          // (it's a zip archive that's incomplete until the eval finishes).
+          // Still start polling for pending samples — the sample buffer DB
+          // is available and the /api/pending-samples endpoint works fine.
+          set((state) => {
+            state.log.loadedLog = logFileName;
+          });
+          state.logActions.clearPendingSampleSummaries();
+          logPolling.startPolling(logFileName);
         }
       },
 

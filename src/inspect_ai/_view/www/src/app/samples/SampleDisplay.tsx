@@ -350,7 +350,7 @@ export const SampleDisplay: FC<SampleDisplayProps> = ({
       ) : undefined}
       <ActivityBar animating={showActivity} />
 
-      {sample && (
+      {(sample || (runningSampleData && runningSampleData.length > 0)) && (
         <TabSet
           id={tabsetId}
           tabsRef={tabsRef}
