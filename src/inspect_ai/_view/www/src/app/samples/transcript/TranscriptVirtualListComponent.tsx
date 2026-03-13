@@ -208,6 +208,10 @@ function computeVisualActionContext(
     const candEvent = candidate.event as ToolEvent;
     if (!BROWSER_TOOL_FUNCTIONS.has(candEvent.function)) break;
     const candArgs = candEvent.arguments as Record<string, unknown>;
+    // A navigate action changes the page entirely — any screenshot
+    // before it is stale, so stop the backward search here.
+    const candAction = candArgs?.action as string | undefined;
+    if (candAction === "navigate") break;
     if (isBrowserScreenshot(candEvent.function, candArgs)) {
       const result = candEvent.result;
       const inputScreenshot = normalizeScreenshotResult(result);
