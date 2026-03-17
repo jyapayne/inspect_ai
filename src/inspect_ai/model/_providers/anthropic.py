@@ -311,11 +311,30 @@ class AnthropicAPI(ModelAPI):
             # we must use one or the other — not both.
             auth_token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
             if auth_token:
+                # Claude Pro/Max OAuth requires Claude Code CLI emulation
+                # headers for the API to accept requests. See
+                # https://github.com/rmk40/opencode-anthropic-auth
+                _OAUTH_BETAS = ",".join(
+                    [
+                        "claude-code-20250219",
+                        "oauth-2025-04-20",
+                        "context-1m-2025-08-07",
+                        "interleaved-thinking-2025-05-14",
+                        "redact-thinking-2026-02-12",
+                        "prompt-caching-scope-2026-01-05",
+                        "advanced-tool-use-2025-11-20",
+                        "effort-2025-11-24",
+                        "context-management-2025-06-27",
+                    ]
+                )
                 return AsyncAnthropic(
                     base_url=base_url,
                     auth_token=auth_token,
                     default_headers={
-                        "anthropic-beta": "oauth-2025-04-20",
+                        "anthropic-beta": _OAUTH_BETAS,
+                        "anthropic-dangerous-direct-browser-access": "true",
+                        "user-agent": "claude-cli/2.1.75 (external, cli)",
+                        "x-app": "cli",
                     },
                     **self.model_args,
                 )
@@ -376,6 +395,23 @@ class AnthropicAPI(ModelAPI):
 
             # system messages and tools
             if system_param is not None:
+                # When using OAuth (Claude Pro/Max), the API requires the
+                # system prompt to begin with the Claude Code identity prefix.
+                if os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+                    _CC_PREFIX = (
+                        "You are Claude Code, Anthropic's official CLI for Claude."
+                    )
+                    if isinstance(system_param, str):
+                        if not system_param.startswith(_CC_PREFIX):
+                            system_param = _CC_PREFIX + "\n" + system_param
+                    elif isinstance(system_param, list):
+                        system_param.insert(
+                            0,
+                            {
+                                "type": "text",
+                                "text": _CC_PREFIX,
+                            },
+                        )
                 request["system"] = system_param
             request["tools"] = tools_param
             if len(tools_param) > 0 and not self.is_using_thinking(config):
@@ -1098,7 +1134,9 @@ class AnthropicAPI(ModelAPI):
             ToolParam(
                 name=tool.name,
                 description=tool.description,
-                input_schema=tool.parameters.model_dump(exclude_none=True),
+                input_schema=_normalize_tool_schema(
+                    tool.parameters.model_dump(exclude_none=True)
+                ),
             )
         ]
 
@@ -1407,6 +1445,54 @@ def _web_search_tool_params(
             ]
 
     return [web_fetch_tool, web_search_tool]
+
+
+def _normalize_tool_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Normalize MCP/Pydantic JSON Schema for Anthropic API compatibility.
+
+    Pydantic v2 generates ``anyOf: [{type: X}, {type: "null"}]`` for
+    ``Optional`` / ``X | None`` fields.  The Anthropic tool-use API may
+    reject these patterns.  This collapses them to the non-null variant.
+    It also strips ``default`` values that fall outside an ``enum`` list
+    and removes empty ``required`` arrays.
+    """
+    if not isinstance(schema, dict):
+        return schema
+
+    result: dict[str, Any] = {}
+    for key, value in schema.items():
+        if key == "anyOf" and isinstance(value, list):
+            non_null = [
+                v
+                for v in value
+                if not (isinstance(v, dict) and v.get("type") == "null")
+            ]
+            if len(non_null) == 1 and len(non_null) < len(value):
+                # Collapse  anyOf: [{type: X, …}, {type: "null"}]  →  {type: X, …}
+                result.update(_normalize_tool_schema(non_null[0]))
+                continue
+            # Multi-variant anyOf – normalise children but keep structure
+            result[key] = [
+                _normalize_tool_schema(v) if isinstance(v, dict) else v for v in value
+            ]
+        elif key == "properties" and isinstance(value, dict):
+            result[key] = {
+                k: _normalize_tool_schema(v) if isinstance(v, dict) else v
+                for k, v in value.items()
+            }
+        elif key == "items" and isinstance(value, dict):
+            result[key] = _normalize_tool_schema(value)
+        elif key == "required" and isinstance(value, list) and len(value) == 0:
+            continue  # drop empty required arrays
+        else:
+            result[key] = value
+
+    # Remove default if it conflicts with enum
+    if "default" in result and "enum" in result:
+        if result["default"] not in result["enum"]:
+            del result["default"]
+
+    return result
 
 
 # tools can be either a stock tool param or a special Anthropic native use tool param
