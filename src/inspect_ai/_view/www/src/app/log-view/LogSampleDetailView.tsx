@@ -74,7 +74,9 @@ export const LogSampleDetailView: FC = () => {
         setSelectedLogFile(routeLogPath);
 
         // Sync logs to ensure we have the latest data
-        void syncLogs();
+        // MUST await before selectSample — syncLog calls clearSelectedSample
+        // which would blow away the handle set by selectSample if not awaited
+        await syncLogs();
 
         // Select the sample
         const targetEpoch = parseInt(routeEpoch, 10);

@@ -259,14 +259,25 @@ export const useLogSelection = () => {
   const selectedSampleSummary = useSelectedSampleSummary();
   const selectedLogFile = useStore((state) => state.logs.selectedLogFile);
   const loadedLog = useStore((state) => state.log.loadedLog);
+  // Fall back to selectedSampleHandle when summaries are temporarily empty
+  // (race condition: setSelectedLogFile clears pendingSampleSummaries before
+  // polling repopulates them, causing useSelectedSampleSummary to return undefined)
+  const selectedSampleHandle = useStore(
+    (state) => state.log.selectedSampleHandle,
+  );
 
   return useMemo(() => {
+    const sample = selectedSampleSummary ?? (selectedSampleHandle ? {
+      id: selectedSampleHandle.id,
+      epoch: selectedSampleHandle.epoch,
+      completed: false,
+    } as SampleSummary : undefined);
     return {
       logFile: selectedLogFile,
       loadedLog: loadedLog,
-      sample: selectedSampleSummary,
+      sample,
     };
-  }, [loadedLog, selectedLogFile, selectedSampleSummary]);
+  }, [loadedLog, selectedLogFile, selectedSampleSummary, selectedSampleHandle]);
 };
 
 export const useCollapseSampleEvent = (
