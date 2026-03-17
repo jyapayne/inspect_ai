@@ -101,13 +101,18 @@ export const SampleDetailComponent: FC<SampleDetailComponentProps> = ({
   const sampleMatchesRequest = useMemo(() => {
     if (!sampleId || !epoch) return false;
     if (!sample) {
-      // Only render without a sample if we have running events to display
-      return runningEvents.length > 0;
+      // Allow rendering while sample is loading (shows activity spinner)
+      // or if we have running events to display during streaming
+      return (
+        sampleStatus === "loading" ||
+        sampleStatus === "streaming" ||
+        runningEvents.length > 0
+      );
     }
     return (
       String(sample.id) === sampleId && sample.epoch === parseInt(epoch, 10)
     );
-  }, [sample, sampleId, epoch, runningEvents]);
+  }, [sample, sampleId, epoch, runningEvents, sampleStatus]);
 
   // Find functionality
   const showFind = useStore((state) => state.app.showFind);
