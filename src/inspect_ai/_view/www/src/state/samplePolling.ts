@@ -155,8 +155,37 @@ export function createSamplePolling(
             sampleActions.setRunningEvents([]);
           }
         } else {
-          if (state.sample.sampleStatus === "streaming") {
-            sampleActions.setSampleStatus("ok");
+          // No running events — the user navigated to an already-completed
+          // sample during a live eval. Load it from the eval file.
+          try {
+            log.debug(
+              `LOADING COMPLETED SAMPLE (no running events): ${summary.id}-${summary.epoch}`,
+            );
+            const sample = await api.get_log_sample(
+              logFile,
+              summary.id,
+              summary.epoch,
+            );
+
+            if (sample) {
+              const migratedSample = resolveSample(sample);
+              sampleActions.setSelectedSample(migratedSample, logFile);
+              sampleActions.setSampleStatus("ok");
+            } else {
+              // Sample not yet available in the eval file — may still be
+              // in-flight. Set status to ok so the UI isn't stuck loading.
+              if (state.sample.sampleStatus === "streaming") {
+                sampleActions.setSampleStatus("ok");
+              }
+            }
+          } catch (e) {
+            // Fallback: sample file may not be written yet
+            log.debug(
+              `Failed to load completed sample ${summary.id}-${summary.epoch}: ${e}`,
+            );
+            if (state.sample.sampleStatus === "streaming") {
+              sampleActions.setSampleStatus("ok");
+            }
           }
           sampleActions.setRunningEvents([]);
         }
