@@ -20,10 +20,18 @@ from test_helpers.sandbox import CannedSandbox
 from test_helpers.utils import skip_if_no_docker
 
 from inspect_ai import Task, eval
+from inspect_ai.agent import (
+    AgentState,
+    HumanAgentCommand,
+    HumanAgentCommandsFilter,
+    human_cli,
+)
 from inspect_ai.agent._human import install as human_install
-from inspect_ai.agent._human.agent import human_cli
+from inspect_ai.agent._human.commands import (
+    human_agent_commands as build_human_agent_commands,
+)
 from inspect_ai.agent._human.commands import submit
-from inspect_ai.agent._human.commands.command import HumanAgentCommand
+from inspect_ai.agent._human.commands.instructions import InstructionsCommand
 from inspect_ai.agent._human.commands.submit import QuitCommand, SubmitCommand
 from inspect_ai.agent._human.install import (
     _BASHRC_APPEND_SCRIPT,
@@ -37,6 +45,7 @@ from inspect_ai.agent._human.install import (
     human_agent_commands,
     install_human_agent,
 )
+from inspect_ai.agent._human.state import HumanAgentState
 from inspect_ai.util._sandbox._framework_directory import (
     _SCRIPT,
     _STAT_ENTRY,
@@ -993,6 +1002,59 @@ async def test_docker_install_refuses_bashrc_symlink(
     assert await _stat(docker_sandbox, "/home/nonroot/.bashrc") == "a1ff 0"
     # Nothing was written into the (verified, root-owned) directory either.
     assert TASK_PY not in await _root_sh(docker_sandbox, f"ls -A {HUMAN_AGENT_DIR}")
+
+
+class _AdditionalCommand(HumanAgentCommand):
+    @property
+    def name(self) -> str:
+        return "additional"
+
+    @property
+    def description(self) -> str:
+        return "Additional test command."
+
+
+def test_human_cli_accepts_public_commands_filter():
+    def commands_filter(
+        commands: list[HumanAgentCommand],
+    ) -> list[HumanAgentCommand]:
+        return [*commands, _AdditionalCommand()]
+
+    filter_: HumanAgentCommandsFilter = commands_filter
+
+    assert callable(human_cli(commands_filter=filter_))
+
+
+async def test_human_cli_commands_filter_seen_by_instructions() -> None:
+    def commands_filter(
+        commands: list[HumanAgentCommand],
+    ) -> list[HumanAgentCommand]:
+        return [*commands, _AdditionalCommand()]
+
+    commands = build_human_agent_commands(
+        AgentState(messages=[]),
+        answer=True,
+        intermediate_scoring=False,
+        record_session=False,
+        instructions=None,
+        commands_filter=commands_filter,
+    )
+
+    # the filter's appended command is in the built list, ahead of the
+    # instructions command that the filter must run before
+    names = [command.name for command in commands]
+    assert names.index("additional") < names.index("instructions")
+
+    # and the instructions command itself was built from the filtered list,
+    # so `task instructions` renders the added command
+    instructions_command = commands[-1]
+    assert isinstance(instructions_command, InstructionsCommand)
+    rendered = await instructions_command.service(
+        HumanAgentState(instructions="do the task")
+    )()
+    assert isinstance(rendered, str)
+    assert "additional" in rendered
+    assert "Additional test command." in rendered
 
 
 @pytest.mark.slow
