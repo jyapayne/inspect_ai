@@ -138,7 +138,7 @@ class _FakeActiveSample:
 @contextlib.contextmanager
 def _active(sample: object | None) -> Iterator[None]:
     """Bind ``sample_active()`` for the duration of the block."""
-    token = _sample_active.set(sample)  # pyright: ignore[reportArgumentType]
+    token = _sample_active.set(sample)  # type: ignore[arg-type]  # duck-typed stand-in, not a real ActiveSample  # pyright: ignore[reportArgumentType]  # duck-typed stand-in, not a real ActiveSample
     try:
         yield
     finally:

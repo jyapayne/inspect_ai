@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING
 import anyio
 import pytest
 
-from inspect_ai.tool import ToolDef, mcp_server_stdio
+from inspect_ai.tool import ContentText, ToolDef, mcp_server_stdio
 from inspect_ai.tool._mcp.connection import mcp_connection
 
 if TYPE_CHECKING:
@@ -69,7 +69,8 @@ def _launches(counter: Path) -> int:
 async def _echo(tools: list[Tool]) -> None:
     echo = next(t for t in tools if ToolDef(t).name == "echo")
     result = await echo(message="hi")
-    assert result[0].text == "hi"  # pyright: ignore[reportIndexIssue,reportAttributeAccessIssue]
+    assert isinstance(result, list) and isinstance(result[0], ContentText)
+    assert result[0].text == "hi"
 
 
 async def test_one_server_launch_per_sample_across_child_tasks(

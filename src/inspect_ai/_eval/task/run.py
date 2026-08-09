@@ -2206,20 +2206,29 @@ async def _sample_resources_cm(
 
     Entered and exited in the sample's own task, so a resource may span setup,
     solver and scoring without the task-affine teardown problem an
-    `AsyncExitStack` carried across tasks would have. Teardown is shielded so a
-    cancelled sample still releases what it acquired.
+    `AsyncExitStack` carried across tasks would have.
+
+    The cancel scope encloses the resources rather than being entered in the
+    `finally`: anyio requires scopes to exit in reverse entry order, so a scope
+    opened after the resources' own scopes (e.g. the task group inside an MCP
+    connection) makes teardown die with "Attempted to exit a cancel scope that
+    isn't the current tasks's current cancel scope". Flipping `shield` on the
+    already-innermost-compatible scope protects teardown from cancellation
+    arriving after the body without changing scope order; resources that must
+    survive an already-delivered cancellation shield their own teardown (as the
+    MCP server kill path does).
     """
     if not resources:
         yield
         return
-    async with contextlib.AsyncExitStack() as exit_stack:
-        for resource in resources:
-            await exit_stack.enter_async_context(resource(state))
-        try:
-            yield
-        finally:
-            with anyio.CancelScope(shield=True):
-                await exit_stack.aclose()
+    with anyio.CancelScope() as scope:
+        async with contextlib.AsyncExitStack() as exit_stack:
+            for resource in resources:
+                await exit_stack.enter_async_context(resource(state))
+            try:
+                yield
+            finally:
+                scope.shield = True
 
 
 async def task_run_sample(
@@ -2680,9 +2689,7 @@ async def _task_run_sample_attempt(
                         sample_summary,
                     )
 
-                async with sandboxenv_cm, _sample_resources_cm(
-                    sample_resources, state
-                ):
+                async with sandboxenv_cm, _sample_resources_cm(sample_resources, state):
                     try:
                         # update active sample wth sandboxes now that we are initialised
                         # (ensure that we still exit init context in presence of sandbox error)

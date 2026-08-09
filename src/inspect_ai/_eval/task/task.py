@@ -99,7 +99,6 @@ class Task:
         setup: Solver | list[Solver] | None = None,
         solver: Solver | Agent | list[Solver] = generate(),
         cleanup: Callable[[TaskState], Awaitable[None]] | None = None,
-        sample_resources: "Sequence[SampleResource] | None" = None,
         scorer: "Scorers" | None = None,
         metrics: list[Metric | dict[str, list[Metric]]]
         | dict[str, list[Metric]]
@@ -131,6 +130,7 @@ class Task:
         tags: list[str] | None = None,
         viewer: ViewerConfig | None = None,
         headline_metric: HeadlineMetric | str | None = None,
+        sample_resources: "Sequence[SampleResource] | None" = None,
         **kwargs: Unpack[TaskDeprecatedArgs],
     ) -> None:
         """Create a task.
@@ -143,14 +143,6 @@ class Task:
             cleanup: Optional cleanup function for task. Called after
                 all solvers and scorers have run for each sample (including if an
                 exception occurs during the run)
-            sample_resources: Async context managers held open for the whole of
-                each sample. Entered once the sample's sandbox is available and
-                exited after scoring and `cleanup`, in the sample's own task, so
-                a resource can span setup, solver and scoring. Use for a
-                connection or process a sample should pay for once (e.g. holding
-                one MCP server for the sample rather than per solver or per tool
-                call). Not part of the task's plan, so adding one does not change
-                task identity or eval-set resume.
             scorer: Scorer used to evaluate model output.
             metrics: Alternative metrics (overrides the metrics provided by the specified scorer).
             model: Default model for task (Optional, defaults to eval model).
@@ -221,6 +213,14 @@ class Task:
                 convention, so `HeadlineMetric(metric="accuracy")` takes that
                 metric from the first score reporting it; the default is the
                 first metric of the first score.
+            sample_resources: Async context managers held open for the whole of
+                each sample. Entered once the sample's sandbox is available and
+                exited after scoring and `cleanup`, in the sample's own task, so
+                a resource can span setup, solver and scoring. Use for a
+                connection or process a sample should pay for once (e.g. holding
+                one MCP server for the sample rather than per solver or per tool
+                call). Not part of the task's plan, so adding one does not change
+                task identity or eval-set resume.
             **kwargs: Deprecated arguments.
         """
         # handle deprecated args
@@ -253,7 +253,6 @@ class Task:
         self.setup = setup
         self.solver = resolve_solver(solver)
         self.cleanup = cleanup
-        self.sample_resources = list(sample_resources) if sample_resources else []
         self.on_checkpoint = on_checkpoint
         self.on_resume = on_resume
         self.scorer = resolve_scorer_metrics(resolve_scorer(scorer), metrics)
@@ -285,6 +284,7 @@ class Task:
         self.tags = tags
         self.viewer = viewer
         self.headline_metric = resolve_headline_metric_spec(headline_metric)
+        self.sample_resources = list(sample_resources) if sample_resources else []
 
     @property
     def name(self) -> str:

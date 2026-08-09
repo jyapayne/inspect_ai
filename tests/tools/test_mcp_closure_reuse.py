@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from inspect_ai.tool import ToolDef, mcp_server_stdio
+from inspect_ai.tool import ContentText, ToolDef, mcp_server_stdio
 from inspect_ai.tool._mcp.connection import mcp_connection
 
 if TYPE_CHECKING:
@@ -80,7 +80,8 @@ def _launches(counter: Path) -> int:
 
 async def _echo(tool: Tool, message: str) -> None:
     result = await tool(message=message)
-    assert result[0].text == message  # pyright: ignore[reportIndexIssue,reportAttributeAccessIssue]
+    assert isinstance(result, list) and isinstance(result[0], ContentText)
+    assert result[0].text == message
 
 
 async def test_without_a_sample_resource_closures_still_launch_per_call(
