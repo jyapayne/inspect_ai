@@ -7,7 +7,6 @@ from logging import getLogger
 from pathlib import Path
 from types import TracebackType
 from typing import Any, AsyncIterator, Callable
-from weakref import WeakKeyDictionary
 
 import anyio
 from mcp.client.session import ClientSession, SamplingFnT
@@ -124,9 +123,13 @@ class MCPServerLocal(MCPServer):
         self._name = name
         self._events = events
         self._timeout = timeout
-        self._task_sessions: WeakKeyDictionary[object, "MCPServerLocalSession"] = (
-            WeakKeyDictionary()
-        )
+        # Per-instance session table keyed by scope (see _session_scope): the
+        # running sample attempt when there is one, else the current task.
+        # Storing it on the instance (rather than the class) means a
+        # recycled task identity in the fallback path can't leak one
+        # sample's cached session — including its cached tool list — into
+        # another sample.
+        self._task_sessions: dict[object, "MCPServerLocalSession"] = {}
 
     @override
     async def __aenter__(self) -> MCPServer:
@@ -145,31 +148,60 @@ class MCPServerLocal(MCPServer):
     async def tools(self) -> list[Tool]:
         return await self._task_session().tools()
 
-    # create a separate MCPServer session per async task, keyed by the running
-    # task OBJECT, rather than per sample. A handoff/subagent's turn, including
-    # its own tools() resolution, runs in its own child task, so it gets a
-    # fresh connection (empty state, for a stateful server) rather than the
-    # parent's live session. That isolation is intentional (see CHANGELOG),
-    # not a safety requirement: concurrent call_tool on one ClientSession is
-    # safe in the mcp SDK.
-    #
-    # Keying by task id would be both stale and unbounded: anyio's
-    # TaskInfo.id is id()-derived, so an id is reusable once its task is
-    # collected, and a session created but never entered (a plain solver
-    # eval only calls tools()) is never evicted. Weak keys make entries die
-    # with their task instead.
+    def _session_scope(self) -> object:
+        """Identity that owns one server process.
+
+        The running **sample attempt** (``ActiveSample``), when there is one.
+        A stdio MCP server is a process inside that sample's sandbox, so the
+        sample attempt is its natural lifetime — and it is the isolation
+        boundary that matters: distinct attempts (concurrent epochs, retries)
+        get distinct objects, so tools can never bind across samples.
+
+        Keying on the current task instead made every task that touched the
+        tool source miss the table and launch another server: the agent
+        bridge serves each tool call from its own task, so one sample paid the
+        exec+import+handshake cost 8-9 times (measured in-sandbox), which is a
+        large share of the event-loop starvation seen at hundreds of concurrent
+        sandboxes. Bridge request tasks descend from the sample's task group,
+        so they observe the same ActiveSample and now share its session.
+
+        A *completed* ActiveSample is not a valid scope: a child task that
+        outlives its sample must not resurrect a server in a torn-down sandbox.
+        Such a task falls back to task scope and fails against a closed
+        session, which is the intended loud failure.
+
+        Outside a sample (bare ``mcp_connection`` in tests or tooling) the
+        current task is the scope, preserving the previous behaviour.
+        """
+        from inspect_ai.log._samples import sample_active
+
+        active = sample_active()
+        if active is not None and active.completed is None:
+            return active
+        return _current_task()
+
     def _task_session(self) -> "MCPServerLocalSession":
-        task = _current_task()
-        session = self._task_sessions.get(task)
+        session_key = (self._session_scope(), self._name)
+        session = self._task_sessions.get(session_key)
         if session is None:
             session = MCPServerLocalSession(
                 self._client,
                 name=self._name,
                 events=self._events,
                 timeout=self._timeout,
+                cache_key=session_key,
+                task_sessions=self._task_sessions,
             )
-            self._task_sessions[task] = session
+            self._task_sessions[session_key] = session
         return session
+
+    def _tool_cache_scope(self) -> object:
+        # Cache token for MCPToolSourceLocal: the per-scope session OBJECT.
+        # Sessions evict themselves from _task_sessions when they close, so a
+        # reused scope identity yields a fresh session object and the tool
+        # source re-resolves rather than serving tools bound to a dead
+        # session.
+        return self._task_session()
 
 
 class MCPServerLocalSession(MCPServer):
@@ -180,6 +212,8 @@ class MCPServerLocalSession(MCPServer):
         name: str,
         events: bool,
         timeout: int | None = None,
+        cache_key: object | None = None,
+        task_sessions: dict[object, "MCPServerLocalSession"] | None = None,
     ) -> None:
         super().__init__()
         self._refcount = 0
@@ -187,6 +221,8 @@ class MCPServerLocalSession(MCPServer):
         self._name = name
         self._events = events
         self._timeout = timeout
+        self._cache_key = cache_key
+        self._task_sessions = task_sessions
         self._session: ClientSession | None = None
         self._exit_stack: AsyncExitStack | None = None
         self._cached_tool_list: list[MCPTool] | None = None
@@ -219,10 +255,10 @@ class MCPServerLocalSession(MCPServer):
                     await self._session.initialize()
                 self._refcount = 1
             except BaseException:
-                # leave the object fully disconnected rather than half-built,
-                # so a retry in this task creates a fresh connection instead
-                # of adopting a broken exit_stack/session pair.
-                await self._close()
+                # a partially-created session must not stay registered under
+                # its scope key: a later caller landing on a reused/matching
+                # key would otherwise adopt it.
+                await self._close_and_evict()
                 raise
 
         return self
@@ -240,14 +276,15 @@ class MCPServerLocalSession(MCPServer):
             with trace_action(logger, "MCPServer", f"disconnect ({self._name})"):
                 assert self._session is not None
                 assert self._exit_stack is not None
-                await self._close()
+                await self._close_and_evict()
 
-    async def _close(self) -> None:
-        # Drop the transport and clear the cached tool list, so a session
-        # reused across two mcp_connection blocks in the same task (this
-        # object stays registered; only its connection closes) re-fetches
-        # from the server rather than serving tools bound to a connection
-        # that no longer exists.
+    async def _close_and_evict(self) -> None:
+        # Drop the transport, clear the cached tool list, and evict this
+        # session from the per-instance registry — so a reused scope key
+        # (task or sample identity) lands a fresh session rather than one
+        # bound to a connection that no longer exists. The identity check
+        # guards against evicting a replacement already registered under the
+        # same key.
         try:
             if self._exit_stack is not None:
                 await self._exit_stack.aclose()
@@ -255,6 +292,12 @@ class MCPServerLocalSession(MCPServer):
             self._session = None
             self._exit_stack = None
             self._cached_tool_list = None
+            if (
+                self._task_sessions is not None
+                and self._cache_key is not None
+                and self._task_sessions.get(self._cache_key) is self
+            ):
+                del self._task_sessions[self._cache_key]
 
     @override
     async def tools(self) -> list[Tool]:
