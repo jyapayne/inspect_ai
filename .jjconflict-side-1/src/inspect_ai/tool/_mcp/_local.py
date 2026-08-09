@@ -191,6 +191,7 @@ class MCPServerLocal(MCPServer):
                 timeout=self._timeout,
                 cache_key=session_key,
                 task_sessions=self._task_sessions,
+                owner=self,
             )
             self._task_sessions[session_key] = session
         return session
@@ -214,6 +215,7 @@ class MCPServerLocalSession(MCPServer):
         timeout: int | None = None,
         cache_key: object | None = None,
         task_sessions: dict[object, "MCPServerLocalSession"] | None = None,
+        owner: "MCPServerLocal | None" = None,
     ) -> None:
         super().__init__()
         self._refcount = 0
@@ -223,6 +225,10 @@ class MCPServerLocalSession(MCPServer):
         self._timeout = timeout
         self._cache_key = cache_key
         self._task_sessions = task_sessions
+        # The MCPServerLocal that created this session, used to re-resolve the
+        # CURRENT session when a tool closure outlives the one that made it
+        # (see _client_session).
+        self._owner = owner
         self._session: ClientSession | None = None
         self._exit_stack: AsyncExitStack | None = None
         self._cached_tool_list: list[MCPTool] | None = None
@@ -395,14 +401,35 @@ class MCPServerLocalSession(MCPServer):
             parameters=parameters,
         )
 
-    # if we have been entered as a context manager then return that session,
-    # otherwise, create a brand new session from the client
+    # if we have been entered as a context manager then return that session;
+    # otherwise adopt the scope's current session, and only as a last resort
+    # create a brand new one from the client
     @contextlib.asynccontextmanager
     async def _client_session(self) -> AsyncIterator[ClientSession]:
         # if _connect has been previously called and we still have the connection
         # to the session, we can just return nit
         if self._session is not None:
             yield self._session
+            return
+
+        # A tool closure outlives the session that produced it: `tools()` binds
+        # each Tool to `self`, and callers hold those closures well past the
+        # connection that resolved them -- the sandbox agent bridge registers
+        # them once and then invokes them per request. Falling straight through
+        # to a private client here started a whole MCP server process per tool
+        # call, bypassing the session table entirely (measured in-sandbox: five
+        # server launches for four tool calls, none of them exiting until the
+        # call returned).
+        #
+        # Re-resolve through the owner instead, which returns the session for
+        # the CURRENT scope -- the live one for this sample when there is one.
+        # Only when that also has no connection do we fall back to a private
+        # client, which keeps a call arriving after its sample has finished
+        # (e.g. trailing scoring) working rather than raising.
+        adopted = self._current_scope_session()
+        if adopted is not None:
+            yield adopted
+            return
 
         # otherwise, create a new session and yield it (it will be cleaned up
         # when the context manager exits)
@@ -425,6 +452,16 @@ class MCPServerLocalSession(MCPServer):
                 ):
                     await session.initialize()
                 yield session
+
+    def _current_scope_session(self) -> ClientSession | None:
+        """The live ClientSession for the current scope, if there is one."""
+        owner = self._owner
+        if owner is None:
+            return None
+        current = owner._task_session()
+        if current is self:
+            return None
+        return current._session
 
     def _sampling_fn(self) -> SamplingFnT | None:
         from inspect_ai.model._model import active_model

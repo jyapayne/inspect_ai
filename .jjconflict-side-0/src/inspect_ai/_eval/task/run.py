@@ -7,7 +7,17 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from logging import getLogger
 from pathlib import PurePath
-from typing import Any, Awaitable, Callable, Literal, NamedTuple, Protocol, TypeAlias
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Literal,
+    NamedTuple,
+    Protocol,
+    Sequence,
+    TypeAlias,
+)
 
 import anyio
 from anyio.abc import TaskGroup
@@ -193,7 +203,7 @@ from inspect_ai.util._span import span
 from inspect_ai.util._store import init_subtask_store
 
 from ..context import init_task_context
-from ..task import Task
+from ..task import SampleResource, Task
 from .enqueue import get_task_enqueuer
 from .error import SampleErrorHandler, _should_eval_fail
 from .generate import task_generate
@@ -1529,6 +1539,7 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
                         scorer_names=scorer_names,
                         scanner=scanner,
                         cleanup=task.cleanup,
+                        sample_resources=task.sample_resources,
                         generate=generate,
                         logger=logger if log_samples else None,
                         log_images=log_images,
@@ -2187,6 +2198,30 @@ def _sample_started() -> float | None:
     return started.timestamp() if started is not None else None
 
 
+@contextlib.asynccontextmanager
+async def _sample_resources_cm(
+    resources: "Sequence[SampleResource]", state: TaskState
+) -> AsyncIterator[None]:
+    """Hold a sample's `Task.sample_resources` open for its whole run.
+
+    Entered and exited in the sample's own task, so a resource may span setup,
+    solver and scoring without the task-affine teardown problem an
+    `AsyncExitStack` carried across tasks would have. Teardown is shielded so a
+    cancelled sample still releases what it acquired.
+    """
+    if not resources:
+        yield
+        return
+    async with contextlib.AsyncExitStack() as exit_stack:
+        for resource in resources:
+            await exit_stack.enter_async_context(resource(state))
+        try:
+            yield
+        finally:
+            with anyio.CancelScope(shield=True):
+                await exit_stack.aclose()
+
+
 async def task_run_sample(
     *,
     task: Task,
@@ -2205,6 +2240,7 @@ async def task_run_sample(
     scorer_names: list[str] | None,
     scanner: "Scanners | None",
     cleanup: Callable[[TaskState], Awaitable[None]] | None,
+    sample_resources: "Sequence[SampleResource]",
     generate: Generate,
     logger: TaskLogger | None,
     log_images: bool,
@@ -2258,6 +2294,7 @@ async def task_run_sample(
             scorer_names=scorer_names,
             scanner=scanner,
             cleanup=cleanup,
+            sample_resources=sample_resources,
             generate=generate,
             logger=logger,
             log_images=log_images,
@@ -2309,6 +2346,7 @@ async def _task_run_sample_attempt(
     scorer_names: list[str] | None,
     scanner: "Scanners | None",
     cleanup: Callable[[TaskState], Awaitable[None]] | None,
+    sample_resources: "Sequence[SampleResource]",
     generate: Generate,
     logger: TaskLogger | None,
     log_images: bool,
@@ -2642,7 +2680,9 @@ async def _task_run_sample_attempt(
                         sample_summary,
                     )
 
-                async with sandboxenv_cm:
+                async with sandboxenv_cm, _sample_resources_cm(
+                    sample_resources, state
+                ):
                     try:
                         # update active sample wth sandboxes now that we are initialised
                         # (ensure that we still exit init context in presence of sandbox error)

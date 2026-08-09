@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import anyio
@@ -34,10 +35,20 @@ pytestmark = pytest.mark.skipif(
 
 
 class _FakeActiveSample:
-    """Scope object standing in for ``ActiveSample`` (identity + completed)."""
+    """Minimal stand-in for `ActiveSample` as a session scope.
 
-    def __init__(self) -> None:
+    Carries the attributes `SampleContextFilter` reads (`task`, `sample.id`,
+    `epoch`) as well as `completed`: any log emitted while this is installed as
+    `sample_active()` passes through that filter, so a fake with only
+    `completed` blows up with AttributeError as soon as another test in the
+    session has attached a handler carrying it.
+    """
+
+    def __init__(self, sample_id: str = "s1") -> None:
         self.completed: float | None = None
+        self.task = "test-task"
+        self.epoch = 1
+        self.sample = SimpleNamespace(id=sample_id)
 
 
 def _counting_server(counter: Path):
