@@ -13,10 +13,10 @@ does for an unpinned name.
 
 from pathlib import Path
 from typing import Iterator
+from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
-from unittest.mock import MagicMock, patch
 
 from inspect_ai.tool._sandbox_tools_utils import sandbox as sandbox_mod
 
@@ -102,7 +102,9 @@ async def test_http_500_still_raises(
     monkeypatch.setattr(sandbox_mod, "_binaries_dir", lambda: tmp_path)
     monkeypatch.setattr(sandbox_mod, "_BUCKET_BASE_URL", "https://bucket.example")
 
-    stream_mock = MagicMock(side_effect=lambda method, url, **kwargs: _FakeStream(500, b""))
+    stream_mock = MagicMock(
+        side_effect=lambda method, url, **kwargs: _FakeStream(500, b"")
+    )
     with patch("inspect_ai._util.download.httpx.stream", stream_mock):
         with pytest.raises(httpx.HTTPStatusError):
             await sandbox_mod._download_from_s3(filename)
