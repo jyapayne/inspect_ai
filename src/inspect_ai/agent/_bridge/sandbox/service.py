@@ -22,7 +22,7 @@ from inspect_ai.util._anyio import inner_exception
 from inspect_ai.util._limit import LimitExceededError
 from inspect_ai.util._sandbox import SandboxEnvironment, sandbox_service
 
-from .._errors import PROVIDER_ERROR_KEY, provider_error_payload
+from .._errors import PROVIDER_ERROR_KEY, ResponseFilterError, provider_error_payload
 from ..anthropic_api import inspect_anthropic_api_request
 from ..completions import inspect_completions_api_request
 from ..google_api import inspect_google_api_request
@@ -48,7 +48,10 @@ def _forward_provider_errors(
     and stay up, instead of the RPC `error` channel triggering a fatal exit.
 
     `LimitExceededError` is deliberately excluded so message/token/cost limit
-    hit during generation properly end the sample.
+    hit during generation properly end the sample. `ResponseFilterError` is
+    excluded for the same reason: a `response_filter` is eval logic, not a
+    passive observer, so its failures fail the sample rather than reaching
+    the scaffold as a model API error it might retry against forever.
 
     A `ModelRefusalError` (`fail_on_refusal`) must also end the sample, but the
     sandbox service dispatcher would swallow a re-raise into an RPC error, so it
@@ -61,7 +64,7 @@ def _forward_provider_errors(
     ) -> dict[str, JsonValue]:
         try:
             return await generate(json_data)
-        except LimitExceededError:
+        except (LimitExceededError, ResponseFilterError):
             raise
         except ModelRefusalError as ex:
             bridge.request_fail(ex)
