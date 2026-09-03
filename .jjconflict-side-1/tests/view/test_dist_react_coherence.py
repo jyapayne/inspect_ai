@@ -9,10 +9,24 @@ and the viewer -- and every ``inspect view bundle`` output -- renders a blank
 page with no console error. This shipped at release/2026-08-11.2 (5551b122):
 index.js carried react-dom@19.2.7 while jsx-runtime.js carried react@19.2.8.
 
-Rolldown output preserves pnpm store paths (``.pnpm/react@X.Y.Z``) in region
-comments, identifying the package versions baked into each chunk. Assert the
-chunk graph resolves exactly one version of react and of react-dom, and that
-the two are identical (react-dom enforces exact equality at runtime).
+Extraction reads the two packages' own runtime version stamps rather than
+build-tool debug metadata (pnpm store paths in region comments), which a
+production-minification build is not obliged to preserve and, as of the
+viewer-pin/inspect-ai-fork-glue bump, no longer does:
+
+- react-dom always compiles in a DevTools hook registration object literal
+  (``{bundleType, version, rendererPackageName, ...}``) naming itself
+  ``react-dom`` next to its own version -- present since React's DevTools
+  hook protocol was introduced and independent of minifier settings.
+- react-dom also always compiles in its React error #527 peer-version guard
+  (``if(actual!==`V`)throw Error(...(527,actual,`V`))``), comparing the
+  react instance it actually loaded against the version it expects -- the
+  literal ``V`` is the same react-dom-embedded expectation as the hook's.
+- react itself has no comparable hook registration (that is renderer-only),
+  so it is identified by its own version stamp immediately following the
+  ``useTransition`` hook export in its public API object -- ``useTransition``
+  is a real exported hook name, not a local identifier, so it survives
+  minification/renaming.
 """
 
 import re
@@ -20,7 +34,11 @@ from pathlib import Path
 
 import inspect_ai._view
 
-_REACT_PACKAGE = re.compile(r"\.pnpm/(react|react-dom)@(\d+\.\d+\.\d+)")
+_REACT_DOM_HOOK = re.compile(
+    r"bundleType:\d+,version:`([^`]+)`,rendererPackageName:`react-dom`"
+)
+_REACT_DOM_GUARD = re.compile(r"throw Error\(\w+\(527,\s*\w+,\s*`([^`]+)`")
+_REACT_VERSION = re.compile(r"useTransition\(\)\}[),]\s*[\w$]+\.version=`([^`]+)`")
 
 
 def _react_versions(assets_dir: Path) -> dict[str, dict[str, set[str]]]:
@@ -28,9 +46,15 @@ def _react_versions(assets_dir: Path) -> dict[str, dict[str, set[str]]]:
     versions: dict[str, dict[str, set[str]]] = {}
     for asset in sorted(assets_dir.glob("*.js")):
         text = asset.read_text(encoding="utf-8")
-        for found in _REACT_PACKAGE.finditer(text):
-            package, version = found.group(1), found.group(2)
-            versions.setdefault(package, {}).setdefault(version, set()).add(asset.name)
+        for pattern, package in (
+            (_REACT_DOM_HOOK, "react-dom"),
+            (_REACT_DOM_GUARD, "react-dom"),
+            (_REACT_VERSION, "react"),
+        ):
+            for version in pattern.findall(text):
+                versions.setdefault(package, {}).setdefault(version, set()).add(
+                    asset.name
+                )
     return versions
 
 
@@ -43,7 +67,8 @@ def test_dist_chunks_share_one_react_version() -> None:
     assert versions.get("react") and versions.get("react-dom"), (
         f"no react/react-dom markers found under {assets_dir} -- dist assets "
         "are missing, are LFS pointers that were not smudged, or the build "
-        "stopped embedding pnpm store paths (update this guard's extraction)"
+        "stopped embedding the react-dom hook/guard and react useTransition "
+        "markers (update this guard's extraction)"
     )
 
     resolved: dict[str, str] = {}

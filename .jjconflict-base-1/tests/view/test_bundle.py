@@ -39,11 +39,17 @@ def test_s3_bundle(mock_s3) -> None:
     for exp in expected_exact:
         assert s3_fs.exists(os.path.join(output_dir, exp))
 
-    # asset filenames
+    # asset filenames -- content-hashed (index-<hash>.js), not literal
+    # "index.js": assert an entry point of each type exists rather than an
+    # exact name.
     assets = s3_fs.ls(os.path.join(output_dir, "assets"))
     asset_names = [os.path.basename(a.name) for a in assets]
-    assert "index.js" in asset_names
-    assert "index.css" in asset_names
+    assert any(
+        name.startswith("index-") and name.endswith(".js") for name in asset_names
+    )
+    assert any(
+        name.startswith("index-") and name.endswith(".css") for name in asset_names
+    )
 
 
 def test_bundle() -> None:
@@ -71,9 +77,17 @@ def test_bundle() -> None:
         for exp in expected_exact:
             assert os.path.exists(os.path.join(output_dir, exp))
 
-        # asset filenames
-        assert os.path.exists(os.path.join(output_dir, "assets", "index.js"))
-        assert os.path.exists(os.path.join(output_dir, "assets", "index.css"))
+        # asset filenames -- content-hashed (index-<hash>.js), not literal
+        # "index.js": assert an entry point of each type exists rather than
+        # an exact name.
+        assets_dir = os.path.join(output_dir, "assets")
+        asset_names = os.listdir(assets_dir)
+        assert any(
+            name.startswith("index-") and name.endswith(".js") for name in asset_names
+        )
+        assert any(
+            name.startswith("index-") and name.endswith(".css") for name in asset_names
+        )
 
         # ensure there is a non-listing.json log file present in logs
         non_manifest_logs = [
@@ -107,11 +121,17 @@ def test_s3_embed(mock_s3) -> None:
     for exp in viewer_expected:
         assert s3_fs.exists(os.path.join(log_dir, exp))
 
-    # asset filenames
+    # asset filenames -- content-hashed (index-<hash>.js), not literal
+    # "index.js": assert an entry point of each type exists rather than an
+    # exact name.
     assets = s3_fs.ls(os.path.join(log_dir, "assets"))
     asset_names = [os.path.basename(a.name) for a in assets]
-    assert "index.js" in asset_names
-    assert "index.css" in asset_names
+    assert any(
+        name.startswith("index-") and name.endswith(".js") for name in asset_names
+    )
+    assert any(
+        name.startswith("index-") and name.endswith(".css") for name in asset_names
+    )
 
     # ensure old viewer/ subdirectory was not created
     assert not s3_fs.exists(os.path.join(log_dir, "viewer"))
@@ -140,9 +160,17 @@ def test_embed() -> None:
         for exp in viewer_expected:
             assert os.path.exists(os.path.join(log_dir, exp))
 
-        # asset filenames
-        assert os.path.exists(os.path.join(log_dir, "assets", "index.js"))
-        assert os.path.exists(os.path.join(log_dir, "assets", "index.css"))
+        # asset filenames -- content-hashed (index-<hash>.js), not literal
+        # "index.js": assert an entry point of each type exists rather than
+        # an exact name.
+        assets_dir = os.path.join(log_dir, "assets")
+        asset_names = os.listdir(assets_dir)
+        assert any(
+            name.startswith("index-") and name.endswith(".js") for name in asset_names
+        )
+        assert any(
+            name.startswith("index-") and name.endswith(".css") for name in asset_names
+        )
 
         # ensure old viewer/ subdirectory was not created
         assert not os.path.exists(os.path.join(log_dir, "viewer"))
