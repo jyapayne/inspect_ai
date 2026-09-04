@@ -1,0 +1,763 @@
+import logging
+import os
+import tempfile
+from pathlib import Path
+
+import pytest
+from test_helpers.utils import (
+    failing_task,
+    failing_task_deterministic,
+    skip_if_no_docker,
+)
+
+from inspect_ai import Task, eval, eval_retry, task
+from inspect_ai.dataset import Sample
+from inspect_ai.log import (
+    ProvenanceData,
+    invalidate_samples,
+    list_eval_logs,
+    read_eval_log,
+    retryable_eval_logs,
+    write_eval_log,
+)
+from inspect_ai.model import GenerateConfig, get_model
+from inspect_ai.model._providers.mockllm import MockLLM
+from inspect_ai.scorer import exact
+from inspect_ai.solver import TaskState, generate, solver
+
+
+def test_eval_retry():
+    # run eval with a solver that fails 2/3 times
+    log = eval(failing_task, limit=1, model="mockllm/model")[0]
+
+    # note the task id so we can be certain it remains the same
+    task_id = log.eval.task_id
+
+    # retry until we succeed (confirming the task_id is stable)
+    while log.status != "success":
+        log = eval_retry(log)[0]
+        assert log.eval.task_id == task_id
+
+
+def test_eval_retryable():
+    with tempfile.TemporaryDirectory() as log_dir:
+        # run eval with a solver that fails 2/3 of the time
+        log = eval(tasks=failing_task, limit=1, model="mockllm/model", log_dir=log_dir)[
+            0
+        ]
+
+        # note the task id so we can be certain it remains the same
+        task_id = log.eval.task_id
+
+        # retry until we succeed (confirming the task_id is stable)
+        retryable = retryable_eval_logs(list_eval_logs(log_dir))
+        while len(retryable) > 0:
+            assert len(retryable) == 1
+            assert retryable[0].task_id == task_id
+            eval_retry(retryable, log_dir=log_dir)
+            retryable = retryable_eval_logs(list_eval_logs(log_dir))
+
+
+@task
+def mytask():
+    return Task(name="custom-task-name", solver=[])
+
+
+def test_eval_retry_with_task_name():
+    log = eval(mytask())[0]
+    log = eval_retry(log)[0]
+
+
+@task
+def hello_world():
+    return Task(
+        dataset=[
+            Sample(
+                input="Just reply with Hello World",
+                target="Hello World",
+            )
+        ],
+        solver=[generate()],
+        scorer=exact(),
+    )
+
+
+def test_eval_retry_with_model_generate_config():
+    generate_config = GenerateConfig(
+        seed=42,
+        temperature=0.7,
+        top_p=0.95,
+        max_connections=1,
+    )
+    model = get_model(
+        model="mockllm/model",
+        config=generate_config,
+    )
+
+    log = eval(
+        model=model,
+        tasks=hello_world(),
+    )[0]
+
+    assert log.status == "success"
+    assert log.eval.model_generate_config == generate_config
+
+    log = eval_retry(log)[0]
+    assert log.status == "success"
+    assert log.eval.model_generate_config == generate_config
+
+
+def test_eval_retry_preserves_token_limit_type():
+    log = eval(
+        model="mockllm/model",
+        tasks=hello_world(),
+        token_limit="output:1m",
+    )[0]
+
+    assert log.status == "success"
+    assert log.eval.config.token_limit == 1_000_000
+    assert log.eval.config.token_limit_type == "output"
+
+    log = eval_retry(log)[0]
+    assert log.status == "success"
+    assert log.eval.config.token_limit == 1_000_000
+    assert log.eval.config.token_limit_type == "output"
+
+
+def test_eval_retry_honors_zero_max_retries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    original = eval(
+        tasks=hello_world(),
+        model="mockllm/model",
+        max_retries=2,
+        log_dir=str(tmp_path),
+        display="none",
+    )[0]
+    assert original.plan.config.max_retries == 2
+    original = invalidate_samples(
+        original,
+        sample_uuids="all",
+        provenance=ProvenanceData(author="test"),
+    )
+
+    attempts = 0
+
+    async def retryable_failure(*args: object, **kwargs: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("retryable failure")
+
+    monkeypatch.setattr(MockLLM, "generate", retryable_failure)
+    monkeypatch.setattr(MockLLM, "should_retry", lambda _self, _ex: True)
+
+    retried = eval_retry(
+        original,
+        max_retries=0,
+        log_dir=str(tmp_path),
+        display="none",
+    )[0]
+
+    assert retried.status == "error"
+    assert retried.plan.config.max_retries == 0
+    assert attempts == 1
+
+
+@solver
+def failing_solver():
+    async def solve(state: TaskState, generate) -> TaskState:
+        raise ValueError("Eval failed!")
+
+    return solve
+
+
+@skip_if_no_docker
+@pytest.mark.slow
+def test_eval_retry_resolves_relative_sandbox_paths():
+    """Test that eval-retry correctly resolves relative sandbox config paths.
+
+    This test verifies that when a task uses a relative path for its sandbox
+    config (e.g., "compose.yaml"), eval-retry resolves it relative to the
+    task file's directory, not the current working directory.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        task_dir = Path(tmpdir) / "my_task"
+        task_dir.mkdir()
+
+        compose_file = task_dir / "compose.yaml"
+        compose_file.write_text(
+            """services:
+  default:
+    image: "python:3.12-slim"
+    command: "tail -f /dev/null"
+    init: true
+    network_mode: none
+"""
+        )
+
+        task_file = task_dir / "task.py"
+        task_file.write_text(
+            """from inspect_ai import Task, task
+from inspect_ai.dataset import Sample
+
+@task
+def my_task():
+    return Task(
+        dataset=[Sample(input="test")],
+        sandbox=("docker", "compose.yaml"),
+    )
+"""
+        )
+
+        # Change to tmpdir (different from task_dir) to ensure CWD != task dir
+        eval_wd = os.getcwd()
+        try:
+            os.chdir(tmpdir)
+
+            # Run eval with a failing solver (limit to 1 sample)
+            log = eval(
+                f"{task_file}@my_task",
+                solver=failing_solver(),
+                model="mockllm/model",
+                limit=1,
+            )[0]
+
+            assert log.status == "error"
+
+            # Verify sandbox config was stored as relative path in log
+            assert log.eval.sandbox is not None
+            assert log.eval.sandbox.config == "compose.yaml"
+
+            # Now retry from tmpdir (not task_dir)
+            # This should work because eval-retry resolves relative to task file
+            # eval_retry uses model and solver from the log
+            log = eval_retry(log)[0]
+
+            # If we get here without Docker errors, the path was resolved correctly
+            # (The eval will still fail due to our failing_solver, but that's expected)
+            assert log.status == "error"
+            if log.error:
+                assert "Error reading docker config" not in log.error.message
+
+        finally:
+            os.chdir(eval_wd)
+
+
+def test_invalidation(tmp_path: Path):
+    @task
+    def task_for_invalidation():
+        return Task(
+            dataset=[
+                Sample(input=f"Just reply with {idx_sample}", target="Hello World")
+                for idx_sample in range(10)
+            ],
+            solver=[generate()],
+            scorer=exact(),
+        )
+
+    model = get_model(model="mockllm/model")
+    (log,) = eval(tasks=[task_for_invalidation()], model=model, log_dir=str(tmp_path))
+
+    assert log.status == "success"
+    log = read_eval_log(log.location)
+    assert log.samples is not None
+    invalid_sample_uuid = str(log.samples[0].uuid)
+    log = invalidate_samples(
+        log,
+        sample_uuids=[invalid_sample_uuid],
+        provenance=ProvenanceData(author="test_person", reason="test_reason"),
+    )
+    write_eval_log(log, location=log.location)
+
+    (log_retried,) = eval_retry(log.location)
+    assert log_retried.status == "success"
+    assert log_retried.eval.eval_id != log.eval.eval_id
+    assert log_retried.samples is not None
+    assert len(log_retried.samples) == 10
+    new_uuids = {sample.uuid for sample in log_retried.samples}
+    old_uuids = {sample.uuid for sample in log.samples or []}
+    assert len(new_uuids) == len(old_uuids)
+    assert new_uuids != old_uuids
+    reused_uuids = old_uuids.intersection(new_uuids)
+    assert reused_uuids == old_uuids - {invalid_sample_uuid}
+
+
+def test_eval_retry_preserves_scorer_attribution(monkeypatch) -> None:
+    # Restored (cached) samples must carry the same SampleScore.scorer
+    # attribution as freshly executed samples. Regression: the cached path
+    # previously omitted `scorer=` so restored scores had scorer=None and
+    # were indistinguishable from solver-set scores in results aggregation.
+    import inspect_ai._eval.task.run as run_mod
+
+    captured: list[list[dict]] = []
+    orig = getattr(run_mod, "eval_results")
+
+    def spy(*args, **kwargs):
+        scores = kwargs.get("scores", args[1] if len(args) > 1 else None)
+        captured.append(list(scores))
+        return orig(*args, **kwargs)
+
+    monkeypatch.setattr(run_mod, "eval_results", spy)
+
+    # 2 samples: first passes, second fails -> retry restores first from
+    # cache and reruns second fresh
+    log1 = eval(
+        failing_task_deterministic([False, True]),
+        model="mockllm/model",
+        fail_on_error=False,
+    )[0]
+    assert log1.status == "success"
+    captured.clear()
+
+    log2 = eval_retry(log1)[0]
+    assert log2.status == "success"
+
+    by_id: dict[int, str | None] = {}
+    for call_scores in captured:
+        for d in call_scores:
+            for ss in d.values():
+                by_id[ss.sample_id] = ss.scorer
+
+    assert 1 in by_id and 2 in by_id
+    assert by_id[2] == "match", f"fresh sample scorer={by_id[2]!r}"
+    assert by_id[1] == "match", f"restored sample scorer={by_id[1]!r}"
+
+
+def test_eval_retry_preserves_token_usage():
+    # 10 samples: first 8 pass, last 2 fail
+    # On retry: fresh iterator, 2 samples read [False, False] -> both pass
+    log1 = eval(
+        failing_task_deterministic([False] * 8 + [True] * 2),
+        model="mockllm/model",
+    )[0]
+
+    assert log1.status == "error"
+    assert log1.stats.model_usage
+    model_name = list(log1.stats.model_usage.keys())[0]
+    tokens1 = log1.stats.model_usage[model_name].total_tokens
+    assert tokens1 > 0
+
+    # Retry - fresh iterator reads [False, False] for the 2 failed samples
+    log2 = eval_retry(log1)[0]
+
+    assert log2.status == "success"
+    tokens2 = log2.stats.model_usage[model_name].total_tokens
+    assert tokens2 > tokens1
+
+
+def test_eval_retry_token_usage_multi_retry():
+    # 4 samples with pattern: [False, True, False, True]
+    # First run: samples 0,2 pass; samples 1,3 fail
+    # Retry 1: 2 samples read [False, True] -> sample 1 passes, sample 3 fails
+    # Retry 2: 1 sample reads [False] -> sample 3 passes
+    log1 = eval(
+        failing_task_deterministic([False, True, False, True]),
+        model="mockllm/model",
+    )[0]
+
+    def get_tokens(log):
+        model_name = list(log.stats.model_usage.keys())[0]
+        return log.stats.model_usage[model_name].total_tokens
+
+    assert log1.status == "error"
+    tokens1 = get_tokens(log1)
+    assert tokens1 > 0
+
+    # First retry
+    log2 = eval_retry(log1)[0]
+    assert log2.status == "error"
+    tokens2 = get_tokens(log2)
+    assert tokens2 > tokens1
+
+    # Second retry
+    log3 = eval_retry(log2)[0]
+    assert log3.status == "success"
+    tokens3 = get_tokens(log3)
+    assert tokens3 > tokens2
+
+
+async def _log_with_clean_sample(
+    log_dir: str, sample_id: int, exclude: object = None
+) -> str | None:
+    """Path of a .eval log in `log_dir` holding a clean copy of `sample_id`."""
+    from inspect_ai.log._file import read_eval_log_sample_async
+
+    for name in os.listdir(log_dir):
+        if not name.endswith(".eval"):
+            continue
+        location = os.path.join(log_dir, name)
+        if exclude == location:
+            continue
+        try:
+            sample = await read_eval_log_sample_async(location, sample_id, 1)
+        except Exception:
+            continue
+        if sample.error is None:
+            return location
+    return None
+
+
+@solver
+def _reuse_flush_probe_solver(log_dir: str, probe_dir: str):
+    # cross-attempt state lives in probe_dir marker files: eval_retry
+    # re-imports the task's source file, so module globals don't survive
+    # into the retry attempt
+    import anyio
+
+    failed_marker = os.path.join(probe_dir, "failed")
+    first_log_marker = os.path.join(probe_dir, "first_log")
+    flushed_marker = os.path.join(probe_dir, "reused_flushed_during_live")
+
+    async def solve(state: TaskState, generate):
+        if state.sample_id == 1:
+            return state
+        if not os.path.exists(failed_marker):
+            # first attempt: fail only once sample 1 is flushed to the log,
+            # so the retry deterministically has a completed sample to reuse
+            with anyio.fail_after(30):
+                while (first_log := await _log_with_clean_sample(log_dir, 1)) is None:
+                    await anyio.sleep(0.1)
+            with open(first_log_marker, "w") as f:
+                f.write(first_log)
+            open(failed_marker, "w").close()
+            raise ValueError("first attempt fails")
+        # retry attempt: while this live sample runs (it completes nothing, so
+        # no threshold/stale-timer flush ever triggers), the seeded log's
+        # log_start flush must have landed the reused sample in the new
+        # destination log
+        with open(first_log_marker) as f:
+            first_log = f.read()
+        with anyio.move_on_after(30):
+            while await _log_with_clean_sample(log_dir, 1, exclude=first_log) is None:
+                await anyio.sleep(0.1)
+            open(flushed_marker, "w").close()
+        return state
+
+    return solve
+
+
+@task
+def _reuse_flush_probe_task(log_dir: str, probe_dir: str) -> Task:
+    return Task(
+        dataset=[
+            Sample(input="Say hello", target="hello"),
+            Sample(input="Say hello again", target="hello"),
+        ],
+        solver=[_reuse_flush_probe_solver(log_dir, probe_dir)],
+    )
+
+
+def test_eval_retry_flushes_reused_samples_during_live_run(tmp_path: Path):
+    # design/retry-seeded-attempt-log.md: a retry seeds its log with the prior
+    # attempt's completed samples before its first flush, so they are
+    # durable/readable in the new attempt's log without waiting for a
+    # live-sample completion (which the probe withholds)
+    log_dir = str(tmp_path / "logs")
+    probe_dir = str(tmp_path / "probe")
+    os.makedirs(log_dir)
+    os.makedirs(probe_dir)
+
+    log = eval(
+        _reuse_flush_probe_task(log_dir, probe_dir),
+        model="mockllm/model",
+        log_dir=log_dir,
+    )[0]
+    assert log.status == "error"
+
+    retryable = retryable_eval_logs(list_eval_logs(log_dir))
+    assert len(retryable) == 1
+    retry_log = eval_retry(retryable, log_dir=log_dir)[0]
+
+    assert os.path.exists(os.path.join(probe_dir, "reused_flushed_during_live"))
+    assert retry_log.status == "success"
+    assert retry_log.samples is not None
+    assert {(s.id, s.epoch) for s in retry_log.samples} == {(1, 1), (2, 1)}
+
+
+def _eval_logs_in(log_dir: str) -> list[str]:
+    return sorted(name for name in os.listdir(log_dir) if name.endswith(".eval"))
+
+
+@solver
+def _seeded_log_probe_solver(log_dir: str, probe_dir: str):
+    # cross-attempt state lives in probe_dir marker files (eval_retry
+    # re-imports the task's source file, so module globals don't survive)
+    import anyio
+
+    failed_marker = os.path.join(probe_dir, "failed")
+    first_log_marker = os.path.join(probe_dir, "first_log")
+    seeded_marker = os.path.join(probe_dir, "destination_with_reused_sample")
+
+    async def solve(state: TaskState, generate):
+        if state.sample_id == 1:
+            return state
+        if not os.path.exists(failed_marker):
+            # first attempt: fail once sample 1 is in the log, so the retry
+            # deterministically has a completed sample to reuse
+            with anyio.fail_after(30):
+                while (first_log := await _log_with_clean_sample(log_dir, 1)) is None:
+                    await anyio.sleep(0.1)
+            with open(first_log_marker, "w") as f:
+                f.write(first_log)
+            open(failed_marker, "w").close()
+            raise ValueError("first attempt fails")
+
+        # retry attempt: the log was seeded and flushed by log_start before
+        # any live sample ran, so the destination must already exist and its
+        # first on-disk version must already carry the reused sample. Recorded
+        # for the test to assert on (so a regression reports as a missing log
+        # rather than failing as a sample error).
+        with open(first_log_marker) as f:
+            first_log = f.read()
+        seeded = await _log_with_clean_sample(log_dir, 1, exclude=first_log)
+        with open(seeded_marker, "w") as f:
+            f.write(seeded or "")
+        return state
+
+    return solve
+
+
+@task
+def _seeded_log_probe_task(log_dir: str, probe_dir: str) -> Task:
+    return Task(
+        dataset=[
+            Sample(input="Say hello", target="hello"),
+            Sample(input="Say hello again", target="hello"),
+        ],
+        solver=[_seeded_log_probe_solver(log_dir, probe_dir)],
+    )
+
+
+def test_eval_retry_seeds_destination_log_before_first_write(
+    tmp_path: Path, monkeypatch
+):
+    # design/retry-seeded-attempt-log.md: a retry attempt seeds its log with
+    # the prior attempt's sample records before its first destination write,
+    # so a hard kill before the seed lands leaves no file (the next retry
+    # chains to the prior attempt's log with its completed samples) rather
+    # than an empty newest log, and the destination's very first on-disk
+    # version already carries the reused set.
+    from typing import Any
+
+    from inspect_ai._eval.task.log import TaskLogger
+
+    log_dir = str(tmp_path / "logs")
+    probe_dir = str(tmp_path / "probe")
+    os.makedirs(log_dir)
+    os.makedirs(probe_dir)
+
+    log = eval(
+        _seeded_log_probe_task(log_dir, probe_dir),
+        model="mockllm/model",
+        log_dir=log_dir,
+    )[0]
+    assert log.status == "error"
+    first_logs = _eval_logs_in(log_dir)
+    assert len(first_logs) == 1
+
+    # record which logs exist when the retry attempt seeds its log (before
+    # the log_start flush that follows the seed)
+    original_seed = TaskLogger.seed_from_prior
+    seed_marker = os.path.join(probe_dir, "logs_at_seed")
+
+    async def recording_seed(self: TaskLogger, *args: Any, **kwargs: Any) -> None:
+        with open(seed_marker, "w") as f:
+            f.write("\n".join(_eval_logs_in(log_dir)))
+        await original_seed(self, *args, **kwargs)
+
+    monkeypatch.setattr(TaskLogger, "seed_from_prior", recording_seed)
+
+    retryable = retryable_eval_logs(list_eval_logs(log_dir))
+    assert len(retryable) == 1
+    retry_log = eval_retry(retryable, log_dir=log_dir)[0]
+
+    assert os.path.exists(seed_marker), "retry attempt never seeded its log"
+    with open(seed_marker) as f:
+        logs_at_seed = f.read().splitlines()
+    # only the prior attempt's log exists until the seed lands
+    assert logs_at_seed == first_logs
+    # ...and the destination's first on-disk version carries the reused sample
+    seeded_marker = os.path.join(probe_dir, "destination_with_reused_sample")
+    assert os.path.exists(seeded_marker), "probe never ran on the retry attempt"
+    with open(seeded_marker) as f:
+        seeded_log = f.read()
+    assert seeded_log and os.path.basename(seeded_log) not in first_logs
+    assert retry_log.status == "success"
+    assert retry_log.samples is not None
+    assert {(s.id, s.epoch) for s in retry_log.samples} == {(1, 1), (2, 1)}
+
+
+@task
+def retry_incomplete_task():
+    return Task(
+        dataset=[
+            Sample(id=1, input="Say hello", target="hello"),
+            Sample(id=2, input="Say hello", target="hello"),
+        ],
+        solver=[generate()],
+    )
+
+
+def _setup_crashed_retry_log(log_dir: str):
+    """Create a crashed 'started' log artifact for `retry_incomplete_task`.
+
+    Rewrites a real eval log as a hard-crash artifact (start journal only, no
+    header), with a buffer DB holding sample 1 completed (unflushed) and
+    sample 2 in progress at crash. Returns (started_log, buffer); the caller
+    owns buffer cleanup.
+    """
+    import zipfile
+    from datetime import datetime, timezone
+
+    from test_helpers.buffer import simulate_crashed_buffer_db
+
+    from inspect_ai._util.file import local_path
+    from inspect_ai._util.json import to_json_str_safe
+    from inspect_ai.event import SampleInitEvent
+    from inspect_ai.log import EvalSampleSummary
+    from inspect_ai.log._recorders.buffer.database import SampleBufferDatabase
+    from inspect_ai.log._recorders.eval import LogStart
+    from inspect_ai.log._recorders.types import SampleEvent
+    from inspect_ai.scorer import Score
+
+    the_task = retry_incomplete_task()
+    samples = list(the_task.dataset)
+
+    started_log = eval(
+        the_task, model="mockllm/model", log_dir=log_dir, run_samples=False
+    )[0]
+    assert started_log.location
+    with zipfile.ZipFile(local_path(started_log.location), "w") as zf:
+        zf.writestr(
+            "_journal/start.json",
+            to_json_str_safe(
+                LogStart(
+                    version=started_log.version,
+                    eval=started_log.eval,
+                    plan=started_log.plan,
+                )
+            ),
+        )
+
+    buffer = SampleBufferDatabase(started_log.location)
+    now = datetime.now(timezone.utc).isoformat()
+    # sample 1: completed (scored) but unflushed at crash
+    completed = EvalSampleSummary(
+        id=1,
+        epoch=1,
+        input="Say hello",
+        target="hello",
+        scores={"accuracy": Score(value="C", answer="hello")},
+        started_at=now,
+        completed_at=now,
+    )
+    buffer.start_sample(completed)
+    buffer.log_events(
+        [SampleEvent(id=1, epoch=1, event=SampleInitEvent(sample=samples[0], state={}))]
+    )
+    buffer.complete_sample(completed, sample_metadata=None)
+
+    # sample 2: in progress at crash
+    in_progress = EvalSampleSummary(
+        id=2, epoch=1, input="Say hello", target="hello", started_at=now
+    )
+    buffer.start_sample(in_progress)
+    buffer.log_events(
+        [SampleEvent(id=2, epoch=1, event=SampleInitEvent(sample=samples[1], state={}))]
+    )
+    simulate_crashed_buffer_db(buffer)
+
+    return started_log, buffer
+
+
+def test_eval_retry_incomplete_action_error_finalizes():
+    """Recovery with incomplete_action='error' finalizes; nothing is retried.
+
+    The crashed log has one completed and one in-progress sample covering the
+    whole dataset, so recovery resolves the in-progress sample as an error and
+    finalizes the log as "success" — eval_retry returns the recovered log
+    without re-running anything.
+    """
+    with tempfile.TemporaryDirectory() as log_dir:
+        started_log, buffer = _setup_crashed_retry_log(log_dir)
+        try:
+            logs = eval_retry(
+                started_log.location, log_dir=log_dir, incomplete_action="error"
+            )
+            assert len(logs) == 1
+            final = logs[0]
+            assert final.status == "success"
+            # the finalized recovered log is returned, not a re-run
+            assert final.location is not None
+            assert "-recovered" in final.location
+
+            recovered = read_eval_log(final.location)
+            assert recovered.samples is not None
+            assert len(recovered.samples) == 2
+            resolved = next(s for s in recovered.samples if s.id == 2)
+            assert resolved.error is not None
+            assert "terminated by operator during recovery" in resolved.error.message
+            # the recovered file is the final log, so the buffer is swept
+            assert not buffer.db_path.exists()
+        finally:
+            buffer.cleanup()
+
+
+def test_eval_retry_incomplete_max_inert_under_retry(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """incomplete_max without a resolving disposition warns once and is ignored.
+
+    The guard only applies to incomplete_action='error'; under the default
+    disposition the in-progress sample is recovered as retryable and re-run,
+    and a single warning makes the inert setting visible.
+    """
+    with tempfile.TemporaryDirectory() as log_dir:
+        started_log, buffer = _setup_crashed_retry_log(log_dir)
+        try:
+            with caplog.at_level(logging.WARNING, logger="inspect_ai"):
+                logs = eval_retry(
+                    started_log.location, log_dir=log_dir, incomplete_max=0
+                )
+            assert len(logs) == 1
+            final = logs[0]
+            assert final.status == "success"
+            assert final.location is not None
+            assert "-recovered" not in final.location
+            warnings = [r for r in caplog.records if "incomplete_max=0" in r.message]
+            assert len(warnings) == 1
+        finally:
+            buffer.cleanup()
+
+
+def test_eval_retry_incomplete_max_falls_back_to_retry():
+    """Exceeding incomplete_max falls back to recover-and-retry.
+
+    With incomplete_max=0 the single in-progress sample exceeds the guard, so
+    the resolving disposition is abandoned: recovery marks the sample as a
+    retryable cancelled error and the retry re-runs it to completion.
+    """
+    with tempfile.TemporaryDirectory() as log_dir:
+        started_log, buffer = _setup_crashed_retry_log(log_dir)
+        try:
+            logs = eval_retry(
+                started_log.location,
+                log_dir=log_dir,
+                incomplete_action="error",
+                incomplete_max=0,
+            )
+            assert len(logs) == 1
+            final = logs[0]
+            assert final.status == "success"
+            # a retry ran (result is a fresh log, not the recovered file)
+            assert final.location is not None
+            assert "-recovered" not in final.location
+
+            retried = read_eval_log(final.location)
+            assert retried.samples is not None
+            assert len(retried.samples) == 2
+            # the in-progress sample was re-run rather than resolved
+            rerun = next(s for s in retried.samples if s.id == 2)
+            assert rerun.error is None
+        finally:
+            buffer.cleanup()
