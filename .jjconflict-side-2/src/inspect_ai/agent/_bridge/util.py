@@ -523,16 +523,16 @@ def _record_filter_answered_interaction(
 
 
 def _bridge_request_metadata(
-    bridge: AgentBridge, config: GenerateConfig
+    bridge: AgentBridge, metadata_headers: dict[str, str] | None
 ) -> dict[str, dict[str, str]]:
     """Select configured non-sensitive request headers for event metadata."""
-    if not bridge.model_event_metadata_headers or config.extra_headers is None:
+    if not bridge.model_event_metadata_headers or metadata_headers is None:
         return {}
 
     selected = {
-        name: config.extra_headers[name]
+        name: metadata_headers[name]
         for name in bridge.model_event_metadata_headers
-        if name in config.extra_headers
+        if name in metadata_headers
     }
     return {BRIDGE_REQUEST_HEADERS: selected} if selected else {}
 
@@ -544,6 +544,7 @@ async def bridge_generate(
     tools: Sequence[ToolInfo | Tool],
     tool_choice: ToolChoice | None,
     config: GenerateConfig,
+    metadata_headers: dict[str, str] | None = None,
     requested_model: str | None = None,
 ) -> tuple[ModelOutput, ChatMessageUser | None]:
     """Generate model output through the agent bridge.
@@ -565,7 +566,7 @@ async def bridge_generate(
     # codex's hardcoded `codex-auto-review` guardian slug onto the eval model),
     # and without this the requested name never reaches the transcript -- so a
     # reviewer turn is indistinguishable from the agent's own.
-    metadata: dict[str, Any] = _bridge_request_metadata(bridge, config)
+    metadata: dict[str, Any] = _bridge_request_metadata(bridge, metadata_headers)
     if requested_model:
         metadata[BRIDGE_REQUESTED_MODEL] = requested_model
     with use_model_event_metadata(metadata):

@@ -130,8 +130,9 @@ async def sandbox_agent_bridge(
         model_event_metadata_headers: Optional non-sensitive client request
             header names to copy into each matching bridged `ModelEvent` under
             `BRIDGE_REQUEST_HEADERS`. Names are normalized to lower case; only
-            these names cross the sandbox RPC boundary, and sensitive names such
-            as authorization and cookies are rejected. Defaults to `None`.
+            these names cross the sandbox RPC boundary as event metadata, never
+            provider headers, and sensitive names such as authorization and cookies
+            are rejected. Defaults to `None`.
         forward_generation_config: Forward client generation parameters (e.g.
             `max_tokens`, `temperature`, reasoning effort) to the model. Defaults
             to `False`, in which case those parameters are dropped and the resolved

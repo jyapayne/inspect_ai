@@ -211,6 +211,8 @@ async def inspect_responses_api_request_impl(
     web_search: WebSearchProviders | None,
     code_execution: CodeExecutionProviders | None,
     bridge: AgentBridge,
+    *,
+    metadata_headers: dict[str, str] | None = None,
 ) -> Response:
     # resolve model
     bridge_model_name = str(json_data["model"])
@@ -326,6 +328,7 @@ async def inspect_responses_api_request_impl(
         tool_choice,
         config,
         requested_model=bridge_model_name,
+        metadata_headers=metadata_headers,
     )
     if c_message is not None:
         messages.append(c_message)

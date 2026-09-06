@@ -1,5 +1,7 @@
 """Tests for model_aliases in resolve_inspect_model."""
 
+from typing import Any, cast
+
 import pytest
 
 from inspect_ai.agent._bridge.util import resolve_inspect_model
@@ -261,13 +263,14 @@ async def test_bridged_events_keep_allowlisted_headers_with_concurrent_requests(
                 [],
                 None,
                 GenerateConfig(
-                    extra_headers={
-                        "x-opencode-session": "provider-session",
-                        "x-parent-session-id": "provider-parent",
-                        "authorization": "Bearer must-not-record",
-                        "x-unselected": "must-not-record",
-                    }
+                    extra_headers={"x-provider-feature": "provider"}
                 ),
+                metadata_headers={
+                    "x-opencode-session": "provider-session",
+                    "x-parent-session-id": "provider-parent",
+                    "authorization": "Bearer must-not-record",
+                    "x-unselected": "must-not-record",
+                },
                 requested_model="same-model",
             ),
             lambda: bridge_generate(
@@ -277,13 +280,14 @@ async def test_bridged_events_keep_allowlisted_headers_with_concurrent_requests(
                 [],
                 None,
                 GenerateConfig(
-                    extra_headers={
-                        "x-session-id": "filter-session",
-                        "x-parent-session-id": "filter-parent",
-                        "cookie": "must-not-record",
-                        "x-unselected": "must-not-record",
-                    }
+                    extra_headers={"x-provider-feature": "filter"}
                 ),
+                metadata_headers={
+                    "x-session-id": "filter-session",
+                    "x-parent-session-id": "filter-parent",
+                    "cookie": "must-not-record",
+                    "x-unselected": "must-not-record",
+                },
                 requested_model="same-model",
             ),
         ]
@@ -311,15 +315,111 @@ async def test_bridged_events_keep_allowlisted_headers_with_concurrent_requests(
     assert headers_by_session["filter-session"][BRIDGE_FILTER_SYNTHETIC] is True
 
 
-def test_bridge_rejects_sensitive_event_metadata_headers() -> None:
-    """A sink opt-in cannot use authorization material as event metadata."""
+async def test_metadata_headers_do_not_reach_model_provider() -> None:
+    """Native session attribution stays out of the provider request."""
+    from inspect_ai.agent._agent import AgentState
+    from inspect_ai.agent._bridge.types import AgentBridge
+    from inspect_ai.agent._bridge.util import bridge_generate
+    from inspect_ai.model._generate_config import GenerateConfig
+
+    provider_requests: list[dict[str, Any]] = []
+    model = get_model(
+        "openai/gpt-5",
+        api_key="local-fake-key",
+        base_url="http://127.0.0.1:9/v1",
+        memoize=False,
+        responses_api=False,
+    )
+
+    async def capture_create(**kwargs: Any) -> None:
+        provider_requests.append(kwargs)
+        raise RuntimeError("stop after capturing provider request")
+
+    cast(Any, model.api).client.chat.completions.create = capture_create
+    bridge = AgentBridge(
+        AgentState(messages=[]),
+        model_event_metadata_headers=("x-opencode-session",),
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="stop after capturing"):
+            await bridge_generate(
+                bridge,
+                model,
+                [],
+                [],
+                None,
+                GenerateConfig(extra_headers={"x-provider-feature": "preserve"}),
+                metadata_headers={"x-opencode-session": "native-session"},
+            )
+    finally:
+        await model.api.aclose()
+
+    assert provider_requests
+    provider_headers = provider_requests[0].get("extra_headers") or {}
+    assert provider_headers["x-provider-feature"] == "preserve"
+    assert "x-opencode-session" not in provider_headers
+
+@pytest.mark.parametrize(
+    ("factory_name", "adapter_name"),
+    [
+        ("generate_completions", "inspect_completions_api_request"),
+        ("generate_responses", "inspect_responses_api_request"),
+        ("generate_anthropic", "inspect_anthropic_api_request"),
+        ("generate_google", "inspect_google_api_request"),
+    ],
+)
+async def test_sandbox_service_passes_metadata_separately_from_provider_headers(
+    monkeypatch: pytest.MonkeyPatch,
+    factory_name: str,
+    adapter_name: str,
+) -> None:
+    """Each service dialect retains separate provider and metadata headers."""
+    from inspect_ai.agent._bridge.sandbox import service
+
+    captured: dict[str, Any] = {}
+
+    class _Completion:
+        def model_dump(self, **kwargs: Any) -> dict[str, Any]:
+            return {}
+
+    async def fake_adapter(*args: Any, **kwargs: Any) -> Any:
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return {} if adapter_name == "inspect_google_api_request" else _Completion()
+
+    monkeypatch.setattr(service, adapter_name, fake_adapter)
+    bridge = cast(Any, object())
+    factory = getattr(service, factory_name)
+    generate = (
+        factory(bridge)
+        if factory_name == "generate_completions"
+        else factory(None, None, bridge)
+    )
+
+    result = await generate(
+        {"model": "inspect"},
+        headers={"x-provider-feature": "preserve"},
+        metadata_headers={"x-opencode-session": "native-session"},
+    )
+
+    assert result == {}
+    assert captured["args"][1] == {"x-provider-feature": "preserve"}
+    assert captured["kwargs"] == {
+        "metadata_headers": {"x-opencode-session": "native-session"}
+    }
+
+
+@pytest.mark.parametrize("header", ("authorization", "x-password"))
+def test_bridge_rejects_sensitive_event_metadata_headers(header: str) -> None:
+    """A sink opt-in cannot use authentication material as event metadata."""
     from inspect_ai.agent._agent import AgentState
     from inspect_ai.agent._bridge.types import AgentBridge
 
     with pytest.raises(ValueError, match="sensitive"):
         AgentBridge(
             AgentState(messages=[]),
-            model_event_metadata_headers=("authorization",),
+            model_event_metadata_headers=(header,),
         )
 
 

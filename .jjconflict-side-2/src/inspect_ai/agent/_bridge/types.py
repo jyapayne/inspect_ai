@@ -45,6 +45,7 @@ _SENSITIVE_MODEL_EVENT_METADATA_HEADER_PARTS = (
     "key",
     "secret",
     "token",
+    "password",
 )
 
 _HTTP_HEADER_TOKEN_CHARACTERS = frozenset("!#$%&'*+-.^_`|~")

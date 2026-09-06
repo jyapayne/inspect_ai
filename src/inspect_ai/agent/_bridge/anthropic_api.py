@@ -19,6 +19,7 @@ async def inspect_anthropic_api_request(
     code_execution: CodeExecutionProviders | None,
     bridge: AgentBridge,
     *,
+    metadata_headers: dict[str, str] | None = None,
     beta: bool = False,
 ) -> "Message | BetaMessage":
     validate_anthropic_client("agent bridge")
@@ -26,5 +27,11 @@ async def inspect_anthropic_api_request(
     from .anthropic_api_impl import inspect_anthropic_api_request_impl
 
     return await inspect_anthropic_api_request_impl(
-        json_data, headers, web_search, code_execution, bridge, beta=beta
+        json_data,
+        headers,
+        web_search,
+        code_execution,
+        bridge,
+        beta=beta,
+        metadata_headers=metadata_headers,
     )

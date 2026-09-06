@@ -72,6 +72,8 @@ async def inspect_google_api_request_impl(
     web_search_providers: WebSearchProviders | None,
     code_execution_providers: CodeExecutionProviders | None,
     bridge: AgentBridge,
+    *,
+    metadata_headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     # resolve model
     bridge_model_name = str(json_data.get("model", "inspect"))
@@ -145,6 +147,7 @@ async def inspect_google_api_request_impl(
         tool_choice,
         config,
         requested_model=bridge_model_name,
+        metadata_headers=metadata_headers,
     )
     if c_message is not None:
         messages.append(c_message)

@@ -36,7 +36,8 @@ JSON_VALUE_ADAPTER: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
 
 RequestHeaders = dict[str, str] | None
 GenerateMethod = Callable[
-    [dict[str, JsonValue], RequestHeaders], Awaitable[dict[str, JsonValue]]
+    [dict[str, JsonValue], RequestHeaders, RequestHeaders],
+    Awaitable[dict[str, JsonValue]],
 ]
 
 
@@ -62,9 +63,10 @@ def _forward_provider_errors(
     async def generate_forwarding_errors(
         json_data: dict[str, JsonValue],
         headers: RequestHeaders = None,
+        metadata_headers: RequestHeaders = None,
     ) -> dict[str, JsonValue]:
         try:
-            return await generate(json_data, headers)
+            return await generate(json_data, headers, metadata_headers)
         except LimitExceededError:
             raise
         except ModelRefusalError as ex:
@@ -132,8 +134,11 @@ def generate_completions(
     async def generate(
         json_data: dict[str, JsonValue],
         headers: RequestHeaders = None,
+        metadata_headers: RequestHeaders = None,
     ) -> dict[str, JsonValue]:
-        completion = await inspect_completions_api_request(json_data, headers, bridge)
+        completion = await inspect_completions_api_request(
+            json_data, headers, bridge, metadata_headers=metadata_headers
+        )
         return completion.model_dump(mode="json", warnings=False)
 
     return generate
@@ -147,9 +152,15 @@ def generate_responses(
     async def generate(
         json_data: dict[str, JsonValue],
         headers: RequestHeaders = None,
+        metadata_headers: RequestHeaders = None,
     ) -> dict[str, JsonValue]:
         completion = await inspect_responses_api_request(
-            json_data, headers, web_search, code_execution, bridge
+            json_data,
+            headers,
+            web_search,
+            code_execution,
+            bridge,
+            metadata_headers=metadata_headers,
         )
         return completion.model_dump(mode="json", warnings=False)
 
@@ -164,9 +175,15 @@ def generate_anthropic(
     async def generate(
         json_data: dict[str, JsonValue],
         headers: RequestHeaders = None,
+        metadata_headers: RequestHeaders = None,
     ) -> dict[str, JsonValue]:
         completion = await inspect_anthropic_api_request(
-            json_data, headers, web_search, code_execution, bridge
+            json_data,
+            headers,
+            web_search,
+            code_execution,
+            bridge,
+            metadata_headers=metadata_headers,
         )
         return completion.model_dump(mode="json", warnings=False)
 
@@ -181,9 +198,15 @@ def generate_google(
     async def generate(
         json_data: dict[str, JsonValue],
         headers: RequestHeaders = None,
+        metadata_headers: RequestHeaders = None,
     ) -> dict[str, JsonValue]:
         completion = await inspect_google_api_request(
-            json_data, headers, web_search, code_execution, bridge
+            json_data,
+            headers,
+            web_search,
+            code_execution,
+            bridge,
+            metadata_headers=metadata_headers,
         )
         return completion
 

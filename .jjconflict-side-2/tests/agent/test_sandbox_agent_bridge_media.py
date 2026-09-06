@@ -123,6 +123,82 @@ def test_sandbox_bridge_cannot_read_host_media(tmp_path: Path) -> None:
         asyncio.run(target_model.api.aclose())
 
 
+
+@skip_if_no_docker
+@pytest.mark.slow
+def test_sandbox_bridge_does_not_forward_metadata_headers_to_provider(
+    tmp_path: Path,
+) -> None:
+    """Native session attribution stays out of the provider request."""
+    provider_requests: list[dict[str, Any]] = []
+    target_model = get_model(
+        "openai/gpt-5",
+        api_key="local-fake-key",
+        base_url="http://127.0.0.1:9/v1",
+        memoize=False,
+        responses_api=False,
+    )
+
+    async def capture_create(**kwargs: Any) -> None:
+        provider_requests.append(kwargs)
+        raise RuntimeError("Stop after capturing provider request.")
+
+    cast(Any, target_model.api).client.chat.completions.create = capture_create
+
+    @solver
+    def bridge_solver() -> Solver:
+        async def solve(state, generate):
+            del generate
+            async with sandbox_agent_bridge(
+                model_aliases={"inspect": target_model},
+                model_event_metadata_headers=("x-opencode-session",),
+            ) as bridge:
+                script = (
+                    "import urllib.error, urllib.request\n"
+                    "body = b'{\"model\":\"inspect\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}'\n"
+                    "request = urllib.request.Request(\n"
+                    f"    'http://127.0.0.1:{bridge.port}/v1/chat/completions',\n"
+                    "    data=body,\n"
+                    "    headers={\n"
+                    "        'Content-Type': 'application/json',\n"
+                    "        'X-OpenCode-Session': 'native-session',\n"
+                    "    },\n"
+                    "    method='POST',\n"
+                    ")\n"
+                    "try:\n"
+                    "    print(urllib.request.urlopen(request).read().decode())\n"
+                    "except urllib.error.HTTPError as ex:\n"
+                    "    print(ex.read().decode())\n"
+                )
+                await sandbox().write_file("bridge_metadata_provider_test.py", script)
+                result = await sandbox().exec(
+                    ["python3", "bridge_metadata_provider_test.py"], timeout=60
+                )
+                state.metadata["bridge_stdout"] = result.stdout
+                state.metadata["bridge_stderr"] = result.stderr
+            return state
+
+        return solve
+
+    logs = eval(
+        Task(
+            dataset=[Sample(id="sample", input="test")],
+            solver=bridge_solver(),
+            sandbox="docker",
+        ),
+        model="mockllm/model",
+        display="none",
+        log_dir=str(tmp_path / "logs"),
+    )
+
+    try:
+        assert logs[0].status == "success"
+        assert provider_requests
+        provider_headers = provider_requests[0].get("extra_headers") or {}
+        assert "x-opencode-session" not in provider_headers
+    finally:
+        asyncio.run(target_model.api.aclose())
+
 @skip_if_no_docker
 @pytest.mark.slow
 def test_sandbox_bridge_scopes_allowlisted_headers_to_model_events(
@@ -145,8 +221,8 @@ def test_sandbox_bridge_scopes_allowlisted_headers_to_model_events(
         tool_choice: object,
         config: GenerateConfig,
     ) -> ModelOutput | None:
-        del model, input, tools, tool_choice
-        if config.extra_headers and config.extra_headers.get("x-session-id") == "filter":
+        del model, tools, tool_choice, config
+        if input and getattr(input[-1], "text", None) == "filter request":
             return ModelOutput.from_content("mockllm/model", "filter output")
         return None
 
@@ -164,38 +240,43 @@ def test_sandbox_bridge_scopes_allowlisted_headers_to_model_events(
                     "x-parent-session-id",
                 ),
             ) as bridge:
-                request = {
-                    "model": "inspect",
-                    "messages": [{"role": "user", "content": "hello"}],
-                }
                 script = (
                     "import json\n"
                     "from concurrent.futures import ThreadPoolExecutor\n"
                     "from urllib.request import Request, urlopen\n"
                     f"url = 'http://127.0.0.1:{bridge.port}/v1/chat/completions'\n"
-                    f"body = {json.dumps(request)!r}.encode()\n"
-                    "def post(headers):\n"
-                    "    request = Request(url, data=body, headers=headers, method='POST')\n"
+                    "def post(request_data):\n"
+                    "    body = json.dumps({\n"
+                    "        'model': 'inspect',\n"
+                    "        'messages': [{'role': 'user', 'content': request_data['content']}],\n"
+                    "    }).encode()\n"
+                    "    request = Request(url, data=body, headers=request_data['headers'], method='POST')\n"
                     "    with urlopen(request) as response:\n"
                     "        return json.loads(response.read())['choices'][0]['message']['content']\n"
-                    "headers = [\n"
+                    "requests = [\n"
                     "    {\n"
-                    "        'Content-Type': 'application/json',\n"
-                    "        'X-OpenCode-Session': 'provider-session',\n"
-                    "        'X-Parent-Session-Id': 'provider-parent',\n"
-                    "        'Authorization': 'Bearer must-not-record',\n"
-                    "        'X-Unselected': 'must-not-record',\n"
+                    "        'content': 'provider request',\n"
+                    "        'headers': {\n"
+                    "            'Content-Type': 'application/json',\n"
+                    "            'X-OpenCode-Session': 'provider-session',\n"
+                    "            'X-Parent-Session-Id': 'provider-parent',\n"
+                    "            'Authorization': 'Bearer must-not-record',\n"
+                    "            'X-Unselected': 'must-not-record',\n"
+                    "        },\n"
                     "    },\n"
                     "    {\n"
-                    "        'Content-Type': 'application/json',\n"
-                    "        'X-Session-Id': 'filter',\n"
-                    "        'X-Parent-Session-Id': 'filter-parent',\n"
-                    "        'Cookie': 'must-not-record',\n"
-                    "        'X-Unselected': 'must-not-record',\n"
+                    "        'content': 'filter request',\n"
+                    "        'headers': {\n"
+                    "            'Content-Type': 'application/json',\n"
+                    "            'X-Session-Id': 'filter',\n"
+                    "            'X-Parent-Session-Id': 'filter-parent',\n"
+                    "            'Cookie': 'must-not-record',\n"
+                    "            'X-Unselected': 'must-not-record',\n"
+                    "        },\n"
                     "    },\n"
                     "]\n"
                     "with ThreadPoolExecutor(max_workers=2) as executor:\n"
-                    "    print(json.dumps(list(executor.map(post, headers))))\n"
+                    "    print(json.dumps(list(executor.map(post, requests))))\n"
                 )
                 await sandbox().write_file("bridge_metadata_test.py", script)
                 result = await sandbox().exec(

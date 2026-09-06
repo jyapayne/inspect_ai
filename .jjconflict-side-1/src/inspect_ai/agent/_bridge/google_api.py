@@ -13,9 +13,16 @@ async def inspect_google_api_request(
     web_search: WebSearchProviders | None,
     code_execution: CodeExecutionProviders | None,
     bridge: AgentBridge,
+    *,
+    metadata_headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     from .google_api_impl import inspect_google_api_request_impl
 
     return await inspect_google_api_request_impl(
-        json_data, headers, web_search, code_execution, bridge
+        json_data,
+        headers,
+        web_search,
+        code_execution,
+        bridge,
+        metadata_headers=metadata_headers,
     )

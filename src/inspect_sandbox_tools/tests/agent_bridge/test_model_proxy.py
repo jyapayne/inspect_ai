@@ -2777,11 +2777,11 @@ async def test_model_proxy_forwards_only_configured_event_metadata_headers(
         "BRIDGE_MODEL_EVENT_METADATA_HEADERS",
         "x-opencode-session,x-parent-session-id",
     )
-    received_headers: list[dict[str, str] | None] = []
+    received_requests: list[dict[str, Any]] = []
 
     async def mock_service(method: str, **params: Any) -> dict[str, Any]:
         assert method == "generate_completions"
-        received_headers.append(params["headers"])
+        received_requests.append(params)
         return {
             "id": "chatcmpl-test",
             "object": "chat.completion",
@@ -2819,12 +2819,71 @@ async def test_model_proxy_forwards_only_configured_event_metadata_headers(
             ) as response:
                 assert response.status == 200
 
-    assert received_headers == [
+    assert received_requests == [
         {
-            "x-opencode-session": "session-1",
-            "x-parent-session-id": "parent-1",
+            "json_data": {
+                "model": "inspect",
+                "messages": [{"role": "user", "content": "hi"}],
+                "parallel_tool_calls": False,
+            },
+            "metadata_headers": {
+                "x-opencode-session": "session-1",
+                "x-parent-session-id": "parent-1",
+            },
         }
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("path", "body", "method"),
+    [
+        (
+            "/v1/chat/completions",
+            {"model": "inspect", "messages": []},
+            "generate_completions",
+        ),
+        ("/v1/responses", {"model": "inspect", "input": []}, "generate_responses"),
+        ("/v1/messages", {"model": "inspect", "messages": []}, "generate_anthropic"),
+        (
+            "/v1beta/models/inspect:generateContent",
+            {"contents": []},
+            "generate_google",
+        ),
+    ],
+)
+async def test_model_proxy_routes_metadata_separately_for_each_dialect(
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    body: dict[str, Any],
+    method: str,
+) -> None:
+    """Configured attribution headers are never RPC provider headers."""
+    monkeypatch.setenv("BRIDGE_MODEL_EVENT_METADATA_HEADERS", "x-opencode-session")
+    received_requests: list[tuple[str, dict[str, Any]]] = []
+
+    async def mock_service(
+        received_method: str, **params: Any
+    ) -> dict[str, Any]:
+        received_requests.append((received_method, params))
+        return {}
+
+    async with _proxy_with_service(mock_service) as base_url:
+        async with ClientSession() as session:
+            async with session.post(
+                f"{base_url}{path}",
+                json=body,
+                headers={"X-OpenCode-Session": "native-session"},
+            ) as response:
+                assert response.status == 200
+
+    assert len(received_requests) == 1
+    received_method, params = received_requests[0]
+    assert received_method == method
+    assert params["metadata_headers"] == {
+        "x-opencode-session": "native-session"
+    }
+    assert "headers" not in params
 
 
 @pytest.mark.asyncio
@@ -2835,6 +2894,18 @@ async def test_model_proxy_rejects_non_token_event_metadata_header_names(
     monkeypatch.setenv("BRIDGE_MODEL_EVENT_METADATA_HEADERS", "x-opencode session")
 
     with pytest.raises(ValueError, match="valid HTTP token"):
+        await model_proxy_server(port=0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("header", ("authorization", "x-password"))
+async def test_model_proxy_rejects_sensitive_event_metadata_header_names(
+    monkeypatch: pytest.MonkeyPatch, header: str
+) -> None:
+    """Proxy configuration cannot expose authentication material in events."""
+    monkeypatch.setenv("BRIDGE_MODEL_EVENT_METADATA_HEADERS", header)
+
+    with pytest.raises(ValueError, match="sensitive"):
         await model_proxy_server(port=0)
 
 

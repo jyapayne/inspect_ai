@@ -45,6 +45,8 @@ async def inspect_completions_api_request(
     json_data: dict[str, Any],
     headers: dict[str, str] | None,
     bridge: AgentBridge,
+    *,
+    metadata_headers: dict[str, str] | None = None,
 ) -> "ChatCompletion":
     validate_openai_client("agent bridge")
 
@@ -105,6 +107,7 @@ async def inspect_completions_api_request(
         tool_choice,
         config,
         requested_model=bridge_model_name,
+        metadata_headers=metadata_headers,
     )
     if c_message is not None:
         messages.append(c_message)
