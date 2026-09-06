@@ -4,6 +4,7 @@
 - Bridged agent transcripts now identify which model a request was for, and record output a generate filter produced.
 - Sandbox agent bridges can attach selected non-sensitive client request headers to their model events for external session attribution.
 - OpenAI: Native Responses agent messages now retain their optional identifiers during replay.
+- Agent Bridge: Native Anthropic Messages streams preserve provider message IDs and served models; bridged Codex Responses events retain root and collab-spawn thread lineage.
 
 ## 0.3.265 (17 September 2026)
 
