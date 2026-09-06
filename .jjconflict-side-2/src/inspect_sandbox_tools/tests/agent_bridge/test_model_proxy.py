@@ -2827,6 +2827,17 @@ async def test_model_proxy_forwards_only_configured_event_metadata_headers(
     ]
 
 
+@pytest.mark.asyncio
+async def test_model_proxy_rejects_non_token_event_metadata_header_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Proxy configuration cannot use field names that change when serialized."""
+    monkeypatch.setenv("BRIDGE_MODEL_EVENT_METADATA_HEADERS", "x-opencode session")
+
+    with pytest.raises(ValueError, match="valid HTTP token"):
+        await model_proxy_server(port=0)
+
+
 def _error_service(status: int | None, message: str) -> Any:
     """A mock bridge service that always returns a forwarded provider error."""
 

@@ -47,6 +47,16 @@ _SENSITIVE_MODEL_EVENT_METADATA_HEADER_PARTS = (
     "token",
 )
 
+_HTTP_HEADER_TOKEN_CHARACTERS = frozenset("!#$%&'*+-.^_`|~")
+
+
+def _is_valid_http_header_name(name: str) -> bool:
+    """Return whether ``name`` has the RFC 9110 HTTP field-name token syntax."""
+    return name.isascii() and all(
+        character.isalnum() or character in _HTTP_HEADER_TOKEN_CHARACTERS
+        for character in name
+    )
+
 
 def _normalize_model_event_metadata_headers(
     headers: Sequence[str] | None,
@@ -64,6 +74,10 @@ def _normalize_model_event_metadata_headers(
         name = header.strip().lower()
         if not name:
             raise ValueError("model event metadata headers cannot be empty")
+        if not _is_valid_http_header_name(name):
+            raise ValueError(
+                "model event metadata headers must be valid HTTP token names"
+            )
         if any(part in name for part in _SENSITIVE_MODEL_EVENT_METADATA_HEADER_PARTS):
             raise ValueError(
                 "model event metadata headers cannot include sensitive headers"

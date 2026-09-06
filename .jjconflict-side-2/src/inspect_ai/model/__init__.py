@@ -118,7 +118,7 @@ __all__ = [
     "BRIDGE_FILTER_SYNTHETIC",
     "BRIDGE_REQUEST_HEADERS",
     "BRIDGE_REQUESTED_MODEL",
-    "GenerateFilter",
+    "BatchConfig",
     "GenerateConfig",
     "GenerateConfigArgs",
     "GenerateFilter",

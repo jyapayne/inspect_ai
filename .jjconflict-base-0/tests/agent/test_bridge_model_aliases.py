@@ -321,3 +321,17 @@ def test_bridge_rejects_sensitive_event_metadata_headers() -> None:
             AgentState(messages=[]),
             model_event_metadata_headers=("authorization",),
         )
+
+
+def test_bridge_rejects_delimited_event_metadata_header_names() -> None:
+    """Header names must survive the proxy's comma-delimited configuration."""
+    from inspect_ai.agent._agent import AgentState
+    from inspect_ai.agent._bridge.types import AgentBridge
+
+    with pytest.raises(ValueError, match="valid HTTP token"):
+        AgentBridge(
+            AgentState(messages=[]),
+            model_event_metadata_headers=(
+                "x-opencode-session,x-parent-session-id",
+            ),
+        )

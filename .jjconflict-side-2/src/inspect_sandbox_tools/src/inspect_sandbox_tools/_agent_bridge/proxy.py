@@ -59,6 +59,17 @@ _SENSITIVE_MODEL_EVENT_METADATA_HEADER_PARTS = (
     "token",
 )
 
+_HTTP_HEADER_TOKEN_CHARACTERS = frozenset("!#$%&'*+-.^_`|~")
+
+
+def _is_valid_http_header_name(name: str) -> bool:
+    """Return whether ``name`` has the RFC 9110 HTTP field-name token syntax."""
+    return name.isascii() and all(
+        character.isalnum() or character in _HTTP_HEADER_TOKEN_CHARACTERS
+        for character in name
+    )
+
+
 
 class AsyncHTTPServer:
     """Async HTTP server supporting GET/POST with streaming + proxy utilities."""
@@ -686,6 +697,13 @@ async def model_proxy_server(
             if header.strip()
         )
     )
+    if any(
+        not _is_valid_http_header_name(header)
+        for header in model_event_metadata_headers
+    ):
+        raise ValueError(
+            "model event metadata headers must be valid HTTP token names"
+        )
     if any(
         part in header
         for header in model_event_metadata_headers
