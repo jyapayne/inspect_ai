@@ -2770,7 +2770,6 @@ async def _proxy_with_service(mock_service: Any) -> AsyncGenerator[str, None]:
             await server.server.wait_closed()
 
 
-
 @pytest.mark.asyncio
 async def test_model_proxy_forwards_only_configured_event_metadata_headers(
     monkeypatch: pytest.MonkeyPatch,
@@ -2865,9 +2864,7 @@ async def test_model_proxy_routes_metadata_separately_for_each_dialect(
     monkeypatch.setenv("BRIDGE_MODEL_EVENT_METADATA_HEADERS", "x-opencode-session")
     received_requests: list[tuple[str, dict[str, Any]]] = []
 
-    async def mock_service(
-        received_method: str, **params: Any
-    ) -> dict[str, Any]:
+    async def mock_service(received_method: str, **params: Any) -> dict[str, Any]:
         received_requests.append((received_method, params))
         return {}
 
@@ -2883,9 +2880,7 @@ async def test_model_proxy_routes_metadata_separately_for_each_dialect(
     assert len(received_requests) == 1
     received_method, params = received_requests[0]
     assert received_method == method
-    assert params["metadata_headers"] == {
-        "x-opencode-session": "native-session"
-    }
+    assert params["metadata_headers"] == {"x-opencode-session": "native-session"}
     assert "headers" not in params
 
 
