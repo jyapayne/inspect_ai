@@ -1,8 +1,11 @@
+import re
 from contextlib import asynccontextmanager
 from io import BytesIO
+from pathlib import Path
 from typing import AsyncIterator, BinaryIO
 
 import pytest
+import semver
 from test_helpers.sandbox import CannedSandbox
 
 from inspect_ai.tool._sandbox_tools_utils import sandbox as sandbox_tools
@@ -12,6 +15,14 @@ from inspect_ai.util._sandbox._framework_directory import _SHELL, _VERIFIED_MARK
 from inspect_ai.util._sandbox.environment import SandboxEnvironment
 from inspect_ai.util._sandbox.recon import Architecture, SupportedContainerOSInfo
 from inspect_ai.util._subprocess import ExecResult
+
+REPO_ROOT = Path(__file__).parents[3]
+SANDBOX_TOOLS_PYPROJECT = REPO_ROOT / "src/inspect_sandbox_tools/pyproject.toml"
+FORK_REVISION = (
+    REPO_ROOT
+    / "src/inspect_ai/tool/_sandbox_tools_utils/sandbox_tools_fork_revision.txt"
+)
+
 
 OK = ExecResult(success=True, returncode=0, stdout="", stderr="")
 """Result of an ordinary (non-helper) command."""
@@ -80,3 +91,12 @@ async def test_injection_rejects_binary_with_wrong_fork_revision(
     # The launcher was started and asked for its version before the mismatch was raised.
     assert ([SANDBOX_CLI, "start-server"], "root") in sandbox.exec_calls
     assert sandbox.exec_calls[-1] == ([SANDBOX_CLI, "exec"], "root")
+
+
+def test_tools_package_version_carries_fork_revision() -> None:
+    pyproject = SANDBOX_TOOLS_PYPROJECT.read_text(encoding="utf-8")
+    version_match = re.search(r'^version = "([^"]+)"$', pyproject, flags=re.MULTILINE)
+    assert version_match is not None
+
+    version = semver.Version.parse(version_match.group(1))
+    assert version.build == f"tl.{int(FORK_REVISION.read_text(encoding='utf-8'))}"
