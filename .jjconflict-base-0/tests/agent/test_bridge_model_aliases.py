@@ -166,7 +166,7 @@ async def test_bridged_event_records_the_client_requested_model() -> None:
                 "thread_id": "root-thread",
                 "installation_id": "do-not-record",
                 "arbitrary": "do-not-record",
-                "parent_thread_id": "do-not-record",
+                "x-codex-parent-thread-id": "do-not-record",
                 "x-openai-subagent": "other",
             },
             {"thread_id": "root-thread"},
@@ -174,7 +174,7 @@ async def test_bridged_event_records_the_client_requested_model() -> None:
         (
             {
                 "thread_id": "child-thread",
-                "parent_thread_id": "root-thread",
+                "x-codex-parent-thread-id": "root-thread",
                 "x-openai-subagent": "collab_spawn",
                 "installation_id": "do-not-record",
             },

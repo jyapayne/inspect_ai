@@ -215,7 +215,7 @@ def _codex_thread_metadata(client_metadata: Any) -> dict[str, str] | None:
         return None
 
     codex_metadata = {"thread_id": thread_id}
-    parent_thread_id = client_metadata.get("parent_thread_id")
+    parent_thread_id = client_metadata.get("x-codex-parent-thread-id")
     if (
         isinstance(parent_thread_id, str)
         and parent_thread_id
