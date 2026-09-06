@@ -276,9 +276,11 @@ class AsyncHTTPServer:
         reason: Optional[str] = None,
     ) -> None:
         """Send an internally-generated streaming response (e.g., SSE)."""
+        # _handle_client closes the writer after every response, so advertise
+        # that lifecycle rather than inviting a client to reuse this socket.
         hdrs = {
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
+            "Connection": "close",
         }
         if headers:
             hdrs.update(headers)

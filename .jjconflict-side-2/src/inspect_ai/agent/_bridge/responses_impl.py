@@ -205,6 +205,27 @@ def _is_openai_responses_provider(model: Model) -> bool:
     return isinstance(model.api, OpenAIAPI)
 
 
+def _codex_thread_metadata(client_metadata: Any) -> dict[str, str] | None:
+    """Project only Codex thread provenance from a Responses body."""
+    if not isinstance(client_metadata, dict):
+        return None
+
+    thread_id = client_metadata.get("thread_id")
+    if not isinstance(thread_id, str) or not thread_id:
+        return None
+
+    codex_metadata = {"thread_id": thread_id}
+    parent_thread_id = client_metadata.get("parent_thread_id")
+    if (
+        isinstance(parent_thread_id, str)
+        and parent_thread_id
+        and client_metadata.get("x-openai-subagent") == "collab_spawn"
+    ):
+        codex_metadata["parent_thread_id"] = parent_thread_id
+        codex_metadata["subagent"] = "collab_spawn"
+    return codex_metadata
+
+
 async def inspect_responses_api_request_impl(
     json_data: dict[str, Any],
     headers: dict[str, str] | None,
@@ -298,6 +319,10 @@ async def inspect_responses_api_request_impl(
                         _harvest_tool_namespaces(discovered, tool_namespaces)
 
     debug_log("SCAFFOLD INPUT", input)
+    codex_thread_metadata = _codex_thread_metadata(
+        json_data.get("client_metadata")
+    )
+
 
     messages = messages_from_responses_input(input, tools, model_name)
     await validate_bridge_media(bridge, messages)
@@ -329,6 +354,7 @@ async def inspect_responses_api_request_impl(
         config,
         requested_model=bridge_model_name,
         metadata_headers=metadata_headers,
+        codex_thread_metadata=codex_thread_metadata,
     )
     if c_message is not None:
         messages.append(c_message)

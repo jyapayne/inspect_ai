@@ -158,6 +158,72 @@ async def test_bridged_event_records_the_client_requested_model() -> None:
     assert metadata.get(BRIDGE_REQUESTED_MODEL) == "codex-auto-review"
 
 
+@pytest.mark.parametrize(
+    ("client_metadata", "expected"),
+    [
+        (
+            {
+                "thread_id": "root-thread",
+                "installation_id": "do-not-record",
+                "arbitrary": "do-not-record",
+                "parent_thread_id": "do-not-record",
+                "x-openai-subagent": "other",
+            },
+            {"thread_id": "root-thread"},
+        ),
+        (
+            {
+                "thread_id": "child-thread",
+                "parent_thread_id": "root-thread",
+                "x-openai-subagent": "collab_spawn",
+                "installation_id": "do-not-record",
+            },
+            {
+                "thread_id": "child-thread",
+                "parent_thread_id": "root-thread",
+                "subagent": "collab_spawn",
+            },
+        ),
+    ],
+    ids=["root", "child"],
+)
+async def test_responses_bridge_records_allowlisted_codex_client_metadata(
+    client_metadata: dict[str, str], expected: dict[str, str]
+) -> None:
+    """Responses client metadata records only Codex thread provenance."""
+    from inspect_ai.agent._agent import AgentState
+    from inspect_ai.agent._bridge.responses import inspect_responses_api_request
+    from inspect_ai.agent._bridge.types import AgentBridge
+    from inspect_ai.agent._bridge.util import (
+        default_code_execution_providers,
+        internal_web_search_providers,
+    )
+
+    sink = _CollectingSink()
+    bridge = AgentBridge(
+        AgentState(messages=[]),
+        model_aliases={"codex": "mockllm/model"},
+        model_event_sink=sink,
+    )
+
+    response = await inspect_responses_api_request(
+        {
+            "model": "codex",
+            "input": "record this provenance",
+            "client_metadata": client_metadata,
+        },
+        None,
+        internal_web_search_providers(),
+        default_code_execution_providers(),
+        bridge,
+    )
+
+    assert response.output_text
+    assert sink.complete, "bridged generate emitted no ModelEvent"
+    metadata = getattr(sink.complete[-1], "metadata", None) or {}
+    assert metadata["agent_bridge"]["codex"] == expected
+
+
 async def test_filter_answered_request_still_records_an_event() -> None:
     """Output a filter produced without generating stays traceable.
 

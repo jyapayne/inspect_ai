@@ -3088,6 +3088,7 @@ async def test_anthropic_streaming_preserves_completed_message_identity_after_ke
                 f"{base_url}/v1/messages", json={**body, "stream": True}
             ) as response:
                 assert response.status == 200
+                assert response.headers["Connection"] == "close"
                 raw_events = [
                     json.loads(event.partition("\ndata: ")[2])
                     for event in (await response.text()).split("\n\n")

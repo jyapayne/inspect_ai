@@ -546,6 +546,7 @@ async def bridge_generate(
     config: GenerateConfig,
     metadata_headers: dict[str, str] | None = None,
     requested_model: str | None = None,
+    codex_thread_metadata: dict[str, str] | None = None,
 ) -> tuple[ModelOutput, ChatMessageUser | None]:
     """Generate model output through the agent bridge.
 
@@ -569,6 +570,8 @@ async def bridge_generate(
     metadata: dict[str, Any] = _bridge_request_metadata(bridge, metadata_headers)
     if requested_model:
         metadata[BRIDGE_REQUESTED_MODEL] = requested_model
+    if codex_thread_metadata is not None:
+        metadata["agent_bridge"] = {"codex": codex_thread_metadata}
     with use_model_event_metadata(metadata):
         return await _bridge_generate(bridge, model, input, tools, tool_choice, config)
 
