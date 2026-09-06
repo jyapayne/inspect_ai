@@ -3,6 +3,7 @@
 - Bugfix: `inspect score --scorer pkg/name` now resolves `@scanner` functions from installed packages (e.g. `inspect_petri/audit_judge`) instead of failing with `LookupError`; unknown names now report the "scorer couldn't be loaded" guidance rather than a raw traceback.
 - Bridged agent transcripts now identify which model a request was for, and record output a generate filter produced.
 - Sandbox agent bridges can attach selected non-sensitive client request headers to their model events for external session attribution.
+- OpenAI: Native Responses agent messages now retain their optional identifiers during replay.
 
 ## 0.3.265 (17 September 2026)
 
