@@ -49,6 +49,16 @@ HOP_BY_HOP = {
     "upgrade",
 }
 
+_MODEL_EVENT_METADATA_HEADERS_ENV = "BRIDGE_MODEL_EVENT_METADATA_HEADERS"
+_SENSITIVE_MODEL_EVENT_METADATA_HEADER_PARTS = (
+    "authorization",
+    "cookie",
+    "credential",
+    "key",
+    "secret",
+    "token",
+)
+
 
 class AsyncHTTPServer:
     """Async HTTP server supporting GET/POST with streaming + proxy utilities."""
@@ -668,6 +678,33 @@ async def model_proxy_server(
     # setup server
     server = AsyncHTTPServer(port=port)
 
+    raw_metadata_headers = os.environ.get(_MODEL_EVENT_METADATA_HEADERS_ENV, "")
+    model_event_metadata_headers = tuple(
+        dict.fromkeys(
+            header.strip().lower()
+            for header in raw_metadata_headers.split(",")
+            if header.strip()
+        )
+    )
+    if any(
+        part in header
+        for header in model_event_metadata_headers
+        for part in _SENSITIVE_MODEL_EVENT_METADATA_HEADER_PARTS
+    ):
+        raise ValueError("model event metadata headers cannot include sensitive headers")
+
+    def _request_metadata_headers(request: dict[str, Any]) -> dict[str, str] | None:
+        """Return only configured safe request headers for the host RPC."""
+        request_headers = request.get("headers")
+        if not isinstance(request_headers, dict):
+            return None
+        selected = {
+            name: value
+            for name in model_event_metadata_headers
+            if isinstance(value := request_headers.get(name), str)
+        }
+        return selected or None
+
     def _sse_bytes(payload: dict[str, Any]) -> bytes:
         # data-only SSE, as used by OpenAI's Chat Completions stream
         # https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events
@@ -727,6 +764,7 @@ async def model_proxy_server(
     async def responses(request: dict[str, Any]) -> dict[str, Any]:
         try:
             json_body = _json_body(request)
+            headers = _request_metadata_headers(request)
             if not _has_model(json_body):
                 return _openai_missing_param("model")
             if json_body.get("input") is None:
@@ -734,7 +772,7 @@ async def model_proxy_server(
             stream = json_body.get("stream", False)
 
             completion = await call_bridge_model_service_async(
-                "generate_responses", json_data=json_body
+                "generate_responses", json_data=json_body, headers=headers
             )
 
             error = _provider_error(completion)
@@ -1461,6 +1499,7 @@ async def model_proxy_server(
     async def chat_completions(request: dict[str, Any]) -> dict[str, Any]:
         try:
             json_body = _json_body(request)
+            headers = _request_metadata_headers(request)
             if not _has_model(json_body):
                 return _openai_missing_param("model")
             if json_body.get("messages") is None:
@@ -1475,7 +1514,7 @@ async def model_proxy_server(
             json_body["parallel_tool_calls"] = False
 
             completion = await call_bridge_model_service_async(
-                "generate_completions", json_data=json_body
+                "generate_completions", json_data=json_body, headers=headers
             )
 
             error = _provider_error(completion)
@@ -1683,6 +1722,7 @@ async def model_proxy_server(
     async def anthropic(request: dict[str, Any]) -> dict[str, Any]:
         try:
             json_body = _json_body(request)
+            headers = _request_metadata_headers(request)
             if not _has_model(json_body):
                 return _anthropic_missing_param("model")
             if json_body.get("messages") is None:
@@ -1724,7 +1764,7 @@ async def model_proxy_server(
                     PING_INTERVAL_S = 5.0
                     task = asyncio.create_task(
                         call_bridge_model_service_async(
-                            "generate_anthropic", json_data=json_body
+                            "generate_anthropic", json_data=json_body, headers=headers
                         )
                     )
                     try:
@@ -2039,7 +2079,7 @@ async def model_proxy_server(
                 }
             else:
                 completion = await call_bridge_model_service_async(
-                    "generate_anthropic", json_data=json_body
+                    "generate_anthropic", json_data=json_body, headers=headers
                 )
                 error = _provider_error(completion)
                 if error is not None:
@@ -2075,6 +2115,7 @@ async def model_proxy_server(
         try:
             path = request.get("path", "")
             json_body = _json_body(request)
+            headers = _request_metadata_headers(request)
 
             is_streaming = ":streamGenerateContent" in path
 
@@ -2084,7 +2125,7 @@ async def model_proxy_server(
             json_body["model"] = model_name
 
             completion = await call_bridge_model_service_async(
-                "generate_google", json_data=json_body
+                "generate_google", json_data=json_body, headers=headers
             )
 
             error = _provider_error(completion)

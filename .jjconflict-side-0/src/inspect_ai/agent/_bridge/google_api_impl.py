@@ -68,6 +68,7 @@ logger = getLogger(__name__)
 
 async def inspect_google_api_request_impl(
     json_data: dict[str, Any],
+    headers: dict[str, str] | None,
     web_search_providers: WebSearchProviders | None,
     code_execution_providers: CodeExecutionProviders | None,
     bridge: AgentBridge,
@@ -127,6 +128,7 @@ async def inspect_google_api_request_impl(
     if not bridge.forward_generation_config:
         clear_generation_params(config)
     validate_client_config(config)
+    config.extra_headers = headers
 
     # try to maintain id stability
     apply_message_ids(bridge, messages)

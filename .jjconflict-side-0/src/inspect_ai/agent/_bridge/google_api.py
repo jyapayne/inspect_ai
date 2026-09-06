@@ -9,6 +9,7 @@ from inspect_ai.tool._tools._web_search._web_search import WebSearchProviders
 
 async def inspect_google_api_request(
     json_data: dict[str, Any],
+    headers: dict[str, str] | None,
     web_search: WebSearchProviders | None,
     code_execution: CodeExecutionProviders | None,
     bridge: AgentBridge,
@@ -16,5 +17,5 @@ async def inspect_google_api_request(
     from .google_api_impl import inspect_google_api_request_impl
 
     return await inspect_google_api_request_impl(
-        json_data, web_search, code_execution, bridge
+        json_data, headers, web_search, code_execution, bridge
     )

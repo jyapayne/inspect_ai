@@ -212,3 +212,112 @@ async def test_filter_answered_request_still_records_an_event() -> None:
     # resulting assistant message back to it by content.
     assert getattr(event, "output").completion == "answered by the filter"
     assert getattr(event, "call") is None
+
+async def test_bridged_events_keep_allowlisted_headers_with_concurrent_requests() -> None:
+    """Each request's selected headers reach only its own bridged event."""
+    from inspect_ai._util._async import tg_collect
+    from inspect_ai.agent._agent import AgentState
+    from inspect_ai.agent._bridge.types import AgentBridge
+    from inspect_ai.agent._bridge.util import bridge_generate
+    from inspect_ai.model._generate_config import GenerateConfig
+    from inspect_ai.model._model import (
+        BRIDGE_FILTER_SYNTHETIC,
+        BRIDGE_REQUEST_HEADERS,
+    )
+    from inspect_ai.model._chat_message import ChatMessage, ChatMessageUser
+    from inspect_ai.model._model_output import ModelOutput
+
+    async def _filter(
+        model: Model,
+        input: list[ChatMessage],
+        tools: object,
+        tool_choice: object,
+        config: GenerateConfig,
+    ) -> ModelOutput | None:
+        del model, tools, tool_choice, config
+        if input and getattr(input[-1], "text", None) == "filter request":
+            return ModelOutput.from_content("mockllm/model", "filter output")
+        return None
+
+    sink = _CollectingSink()
+    bridge = AgentBridge(
+        AgentState(messages=[]),
+        model_event_sink=sink,
+        filter=_filter,
+        model_event_metadata_headers=(
+            "X-OpenCode-Session",
+            "X-Session-Id",
+            "X-Parent-Session-Id",
+        ),
+    )
+    model = get_model("mockllm/model")
+
+    outputs = await tg_collect(
+        [
+            lambda: bridge_generate(
+                bridge,
+                model,
+                [],
+                [],
+                None,
+                GenerateConfig(
+                    extra_headers={
+                        "x-opencode-session": "provider-session",
+                        "x-parent-session-id": "provider-parent",
+                        "authorization": "Bearer must-not-record",
+                        "x-unselected": "must-not-record",
+                    }
+                ),
+                requested_model="same-model",
+            ),
+            lambda: bridge_generate(
+                bridge,
+                model,
+                [ChatMessageUser(content="filter request")],
+                [],
+                None,
+                GenerateConfig(
+                    extra_headers={
+                        "x-session-id": "filter-session",
+                        "x-parent-session-id": "filter-parent",
+                        "cookie": "must-not-record",
+                        "x-unselected": "must-not-record",
+                    }
+                ),
+                requested_model="same-model",
+            ),
+        ]
+    )
+
+    assert outputs[1][0].completion == "filter output"
+
+    assert len(sink.pending) == 2
+    assert len(sink.complete) == 2
+    event_metadata = [getattr(event, "metadata", None) or {} for event in sink.complete]
+    headers_by_session = {
+        metadata[BRIDGE_REQUEST_HEADERS].get(
+            "x-opencode-session", metadata[BRIDGE_REQUEST_HEADERS].get("x-session-id")
+        ): metadata
+        for metadata in event_metadata
+    }
+    assert headers_by_session["provider-session"][BRIDGE_REQUEST_HEADERS] == {
+        "x-opencode-session": "provider-session",
+        "x-parent-session-id": "provider-parent",
+    }
+    assert headers_by_session["filter-session"][BRIDGE_REQUEST_HEADERS] == {
+        "x-session-id": "filter-session",
+        "x-parent-session-id": "filter-parent",
+    }
+    assert headers_by_session["filter-session"][BRIDGE_FILTER_SYNTHETIC] is True
+
+
+def test_bridge_rejects_sensitive_event_metadata_headers() -> None:
+    """A sink opt-in cannot use authorization material as event metadata."""
+    from inspect_ai.agent._agent import AgentState
+    from inspect_ai.agent._bridge.types import AgentBridge
+
+    with pytest.raises(ValueError, match="sensitive"):
+        AgentBridge(
+            AgentState(messages=[]),
+            model_event_metadata_headers=("authorization",),
+        )

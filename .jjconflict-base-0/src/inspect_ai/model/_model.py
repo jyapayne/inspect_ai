@@ -2936,6 +2936,14 @@ No provider request was made (`call` is `None`), but the scaffold consumed the
 output, so the event exists to keep the resulting assistant message traceable.
 """
 
+BRIDGE_REQUEST_HEADERS: Final = "bridge_request_headers"
+"""`ModelEvent.metadata` key: selected client request headers for a bridge call.
+
+Present only when a bridge opted into individual non-sensitive header names and
+the request supplied at least one of them. The mapping's lower-case keys are
+the configured names; it never contains unselected request headers.
+"""
+
 
 _model_event_metadata: ContextVar[dict[str, Any] | None] = ContextVar(
     "_model_event_metadata", default=None

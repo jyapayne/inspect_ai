@@ -58,6 +58,7 @@ class SandboxAgentBridge(AgentBridge):
         allow_remote_mcp: bool = False,
         allow_remote_media: bool = False,
         model_resolver: ModelResolver | None = None,
+        model_event_metadata_headers: Sequence[str] | None = None,
     ) -> None:
         super().__init__(
             state,
@@ -73,6 +74,7 @@ class SandboxAgentBridge(AgentBridge):
             allow_remote_mcp=allow_remote_mcp,
             allow_remote_media=allow_remote_media,
             model_resolver=model_resolver,
+            model_event_metadata_headers=model_event_metadata_headers,
         )
         self.port = port
         self.mcp_server_configs = mcp_server_configs or []

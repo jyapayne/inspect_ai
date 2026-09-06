@@ -2767,6 +2767,66 @@ async def _proxy_with_service(mock_service: Any) -> AsyncGenerator[str, None]:
             await server.server.wait_closed()
 
 
+
+@pytest.mark.asyncio
+async def test_model_proxy_forwards_only_configured_event_metadata_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The proxy never writes raw inbound headers into the bridge RPC."""
+    monkeypatch.setenv(
+        "BRIDGE_MODEL_EVENT_METADATA_HEADERS",
+        "x-opencode-session,x-parent-session-id",
+    )
+    received_headers: list[dict[str, str] | None] = []
+
+    async def mock_service(method: str, **params: Any) -> dict[str, Any]:
+        assert method == "generate_completions"
+        received_headers.append(params["headers"])
+        return {
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "inspect",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "total_tokens": 2,
+            },
+        }
+
+    async with _proxy_with_service(mock_service) as base_url:
+        async with ClientSession() as session:
+            async with session.post(
+                f"{base_url}/v1/chat/completions",
+                json={
+                    "model": "inspect",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                headers={
+                    "Authorization": "Bearer must-not-cross-rpc",
+                    "Cookie": "must-not-cross-rpc",
+                    "X-OpenCode-Session": "session-1",
+                    "X-Parent-Session-Id": "parent-1",
+                    "X-Unselected": "must-not-cross-rpc",
+                },
+            ) as response:
+                assert response.status == 200
+
+    assert received_headers == [
+        {
+            "x-opencode-session": "session-1",
+            "x-parent-session-id": "parent-1",
+        }
+    ]
+
+
 def _error_service(status: int | None, message: str) -> Any:
     """A mock bridge service that always returns a forwarded provider error."""
 

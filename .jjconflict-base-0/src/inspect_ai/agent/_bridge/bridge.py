@@ -558,6 +558,7 @@ def init_google_request_patch() -> None:
             if model_name and targets_inspect_model({"model": model_name}):
                 response = await inspect_google_api_request(
                     cast(dict[str, Any], request_dict),
+                    None,
                     config.web_search,
                     config.code_execution,
                     config.bridge,

@@ -63,6 +63,7 @@ async def sandbox_agent_bridge(
     client_mcp_servers: bool | None = None,
     bridged_tools: Sequence[BridgedToolsSpec] | None = None,
     model_event_sink: ModelEventSink | None = None,
+    model_event_metadata_headers: Sequence[str] | None = None,
     forward_generation_config: bool = False,
     approval: list["ApprovalPolicy"] | None = None,
     checkpointer: Checkpointer | None = None,
@@ -126,6 +127,11 @@ async def sandbox_agent_bridge(
             emission for calls routed through the bridge. When set, the bridge
             installs it around `model.generate()` so the sink decides when and
             under which span each event is emitted to the transcript.
+        model_event_metadata_headers: Optional non-sensitive client request
+            header names to copy into each matching bridged `ModelEvent` under
+            `BRIDGE_REQUEST_HEADERS`. Names are normalized to lower case; only
+            these names cross the sandbox RPC boundary, and sensitive names such
+            as authorization and cookies are rejected. Defaults to `None`.
         forward_generation_config: Forward client generation parameters (e.g.
             `max_tokens`, `temperature`, reasoning effort) to the model. Defaults
             to `False`, in which case those parameters are dropped and the resolved
@@ -185,6 +191,7 @@ async def sandbox_agent_bridge(
                 model_aliases=model_aliases,
                 model_resolver=model_resolver,
                 model_event_sink=model_event_sink,
+                model_event_metadata_headers=model_event_metadata_headers,
                 forward_generation_config=forward_generation_config,
                 approval=approval,
                 checkpointer=checkpointer,
@@ -227,6 +234,15 @@ async def sandbox_agent_bridge(
                     env={
                         f"{MODEL_SERVICE.upper()}_PORT": str(port),
                         f"{MODEL_SERVICE.upper()}_INSTANCE": instance,
+                        **(
+                            {
+                                "BRIDGE_MODEL_EVENT_METADATA_HEADERS": ",".join(
+                                    sorted(bridge.model_event_metadata_headers)
+                                )
+                            }
+                            if bridge.model_event_metadata_headers
+                            else {}
+                        ),
                     },
                     poll_timeout=600,
                 ),

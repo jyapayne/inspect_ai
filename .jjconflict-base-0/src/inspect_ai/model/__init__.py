@@ -61,6 +61,7 @@ from ._google_convert import messages_from_google, model_output_from_google
 from ._message_ids import stable_message_ids
 from ._model import (
     BRIDGE_FILTER_SYNTHETIC,
+    BRIDGE_REQUEST_HEADERS,
     BRIDGE_REQUESTED_MODEL,
     GenerateFilter,
     GenerateInput,
@@ -115,8 +116,9 @@ from ._trim import trim_messages
 
 __all__ = [
     "BRIDGE_FILTER_SYNTHETIC",
+    "BRIDGE_REQUEST_HEADERS",
     "BRIDGE_REQUESTED_MODEL",
-    "BatchConfig",
+    "GenerateFilter",
     "GenerateConfig",
     "GenerateConfigArgs",
     "GenerateFilter",
