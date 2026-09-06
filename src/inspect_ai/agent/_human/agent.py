@@ -1,5 +1,5 @@
-from contextlib import AbstractAsyncContextManager
-from typing import Callable, cast
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from typing import AsyncIterator, Callable, cast
 
 import anyio
 
@@ -82,12 +82,26 @@ def human_cli(
                     # install agent tools
                     await install_human_agent(user, commands, bashrc, record_session)
 
-                    # hookup the view ui
-                    view.connect(connection)
+                    ready_callback: (
+                        Callable[[], AbstractAsyncContextManager[None]] | None
+                    )
+                    if on_ready is None:
+                        view.connect(connection)
+                        ready_callback = None
+                    else:
+                        user_on_ready = on_ready
+
+                        @asynccontextmanager
+                        async def connect_view_when_ready() -> AsyncIterator[None]:
+                            async with user_on_ready():
+                                view.connect(connection)
+                                yield
+
+                        ready_callback = connect_view_when_ready
 
                     # run sandbox service
                     return await run_human_agent_service(
-                        user, state, commands, view, on_ready
+                        user, state, commands, view, ready_callback
                     )
 
             # support both fullscreen ui and fallback

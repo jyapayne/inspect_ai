@@ -10,7 +10,7 @@ import threading
 import time
 from argparse import Namespace
 from collections.abc import AsyncIterator, Iterator
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, contextmanager
 from io import StringIO
 from pathlib import Path
 from typing import Callable, Literal, NamedTuple, overload
@@ -25,6 +25,7 @@ from test_helpers.utils import skip_if_no_docker
 from inspect_ai import Task, eval
 from inspect_ai.agent._human import install as human_install
 from inspect_ai.agent import AgentState
+from inspect_ai.agent._human import agent as human_agent
 from inspect_ai.agent._human import service as human_service
 from inspect_ai.agent._human.agent import human_cli
 from inspect_ai.agent._human.commands import submit
@@ -1066,6 +1067,71 @@ def test_human_cli(user: str | None) -> None:
             assert closed.is_set()
         else:
             raise Exception("eval() did not complete within timeout")
+
+async def test_human_cli_connects_view_after_ready_context_enters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeSandbox:
+        async def connection(self, *, user: str | None) -> object:
+            return object()
+
+        @contextmanager
+        def no_events(self) -> Iterator[None]:
+            yield
+
+    class FakeConsoleView:
+        def connect(self, connection: object) -> None:
+            events.append("view-connected")
+
+        def update_state(self, state: object) -> None:
+            pass
+
+    @asynccontextmanager
+    async def on_ready() -> AsyncIterator[None]:
+        events.append("ready-entered")
+        try:
+            yield
+        finally:
+            events.append("ready-exited")
+
+    async def fake_install_human_agent(*_: object) -> None:
+        events.append("installed")
+
+    async def fake_run_human_agent_service(
+        user: str | None,
+        state: AgentState,
+        commands: list[object],
+        view: object,
+        ready: Callable[[], AbstractAsyncContextManager[None]] | None,
+    ) -> AgentState:
+        assert ready is not None
+        events.append("service-started")
+        async with ready():
+            events.append("service-running")
+        events.append("service-finished")
+        return state
+
+    monkeypatch.setattr(human_agent, "sandbox", lambda: FakeSandbox())
+    monkeypatch.setattr(human_agent, "display_type", lambda: "plain")
+    monkeypatch.setattr(human_agent, "ConsoleView", FakeConsoleView)
+    monkeypatch.setattr(human_agent, "install_human_agent", fake_install_human_agent)
+    monkeypatch.setattr(
+        human_agent, "run_human_agent_service", fake_run_human_agent_service
+    )
+
+    await human_cli(on_ready=on_ready)(AgentState(messages=[]))
+
+    assert events == [
+        "installed",
+        "service-started",
+        "ready-entered",
+        "view-connected",
+        "service-running",
+        "ready-exited",
+        "service-finished",
+    ]
 
 async def test_human_cli_ready_context_waits_for_service_start(
     monkeypatch: pytest.MonkeyPatch,
