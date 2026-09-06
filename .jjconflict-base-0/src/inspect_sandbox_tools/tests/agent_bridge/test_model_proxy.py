@@ -1797,6 +1797,9 @@ async def test_anthropic_messages_streaming(
     # Check key event types were received
     event_types = {e.type for e in events if hasattr(e, "type")}
     assert "message_start" in event_types
+    message_start = next(event for event in events if event.type == "message_start")
+    assert message_start.message.id == "msg_test123"
+    assert message_start.message.model == "claude-opus-4-1-20250805"
     assert "content_block_start" in event_types
     assert "content_block_delta" in event_types
     assert "content_block_stop" in event_types
@@ -3053,6 +3056,59 @@ async def test_proxy_survives_provider_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_anthropic_streaming_preserves_completed_message_identity_after_keepalive() -> (
+    None
+):
+    """Stream identity matches the completed bridge response after keepalives."""
+    completion = {
+        "id": "native-completion-id",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-returned-model",
+        "content": [{"type": "text", "text": "completed"}],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+
+    async def mock_service(method: str, **params: Any) -> dict[str, Any]:
+        assert method == "generate_anthropic"
+        if params["json_data"].get("stream"):
+            await asyncio.sleep(5.1)
+        return completion
+
+    body = {
+        "model": "claude-requested-model",
+        "max_tokens": 8,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    async with _proxy_with_service(mock_service) as base_url:
+        async with ClientSession() as session:
+            async with session.post(
+                f"{base_url}/v1/messages", json={**body, "stream": True}
+            ) as response:
+                assert response.status == 200
+                raw_events = [
+                    json.loads(event.partition("\ndata: ")[2])
+                    for event in (await response.text()).split("\n\n")
+                    if event
+                ]
+
+            async with session.post(f"{base_url}/v1/messages", json=body) as response:
+                assert response.status == 200
+                non_streaming = await response.json()
+
+    assert raw_events[0] == {"type": "ping"}
+    message_start = next(
+        event for event in raw_events if event["type"] == "message_start"
+    )
+    assert message_start["message"]["id"] == "native-completion-id"
+    assert message_start["message"]["model"] == "claude-returned-model"
+    assert non_streaming["id"] == message_start["message"]["id"]
+    assert non_streaming["model"] == message_start["message"]["model"]
+
+
+@pytest.mark.asyncio
 async def test_anthropic_streaming_provider_error_emits_sse_error() -> None:
     """The Anthropic streaming path forwards the error as an SSE error event."""
     body = {
@@ -3066,7 +3122,7 @@ async def test_anthropic_streaming_provider_error_emits_sse_error() -> None:
             async with session.post(f"{base_url}/v1/messages", json=body) as response:
                 assert response.status == 200
                 text = await response.text()
-    assert "event: message_start" in text
+    assert "event: message_start" not in text
     assert "event: error" in text
     assert "rate_limit_error" in text
     assert "overloaded" in text
