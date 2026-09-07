@@ -69,14 +69,41 @@ class _OverrideCommand(HumanAgentCommand):
 
     @override
     def cli(self, args: Namespace) -> None:
+        """The generated handler documentation contains @override
+        and is emitted by this custom command."""
+        # @override
+        message = """handler literal @override
+        is preserved."""
         del args
+        print(override.__doc__.splitlines()[0])
+        print(message.splitlines()[0])
 
 
-def test_generated_human_agent_commands_strip_type_only_override() -> None:
+def test_generated_human_agent_commands_execute_override_handler(
+    tmp_path: Path,
+) -> None:
     task_py = human_agent_commands([_OverrideCommand()])
+    (tmp_path / "human_agent.py").write_text(
+        "def call_human_agent(*args, **kwargs):\n    return None\n",
+        encoding="utf-8",
+    )
+    task_py_path = tmp_path / "task.py"
+    task_py_path.write_text(task_py, encoding="utf-8")
 
-    assert "@override" not in task_py
-    compile(task_py, "task.py", "exec")
+    result = subprocess.run(
+        [sys.executable, str(task_py_path), "override"],
+        cwd=tmp_path,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == (
+        "The generated handler documentation contains @override\n"
+        "handler literal @override\n"
+    )
+    assert "# @override\n" in task_py
 
 
 @pytest.mark.parametrize(
