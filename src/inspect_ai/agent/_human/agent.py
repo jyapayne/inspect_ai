@@ -1,4 +1,5 @@
-from typing import cast
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from typing import AsyncIterator, Callable, cast
 
 import anyio
 
@@ -7,6 +8,7 @@ from inspect_ai.util._sandbox.events import SandboxEnvironmentProxy
 
 from .._agent import Agent, AgentState, agent
 from .commands import human_agent_commands
+from .commands.command import HumanAgentCommandsFilter
 from .install import install_human_agent
 from .panel import HumanAgentPanel
 from .service import run_human_agent_service
@@ -21,6 +23,8 @@ def human_cli(
     user: str | None = None,
     instructions: str | None = None,
     bashrc: str | None = None,
+    commands_filter: HumanAgentCommandsFilter | None = None,
+    on_ready: Callable[[], AbstractAsyncContextManager[None]] | None = None,
 ) -> Agent:
     """Human CLI agent for tasks that run in a sandbox.
 
@@ -43,6 +47,12 @@ def human_cli(
        user: User to login as. Defaults to the sandbox environment's default user.
        instructions: Additional instructions beyond the default task command instructions.
        bashrc: Additional content to include in the .bashrc file for the human cli shell.
+       commands_filter: Optional transform applied to the default command
+          list before it is installed (and before the instructions command is
+          built, so `task instructions` lists any added commands). Lets a caller
+          swap or append `HumanAgentCommand`s without forking this function.
+       on_ready: Optional async context manager entered after the human command
+          service is available in the sandbox and exited when the session ends.
 
     Returns:
        Agent: Human CLI agent.
@@ -73,16 +83,33 @@ def human_cli(
                         intermediate_scoring,
                         record_session,
                         instructions,
+                        commands_filter,
                     )
 
                     # install agent tools
                     await install_human_agent(user, commands, bashrc, record_session)
 
-                    # hookup the view ui
-                    view.connect(connection)
+                    ready_callback: (
+                        Callable[[], AbstractAsyncContextManager[None]] | None
+                    )
+                    if on_ready is None:
+                        view.connect(connection)
+                        ready_callback = None
+                    else:
+                        user_on_ready = on_ready
+
+                        @asynccontextmanager
+                        async def connect_view_when_ready() -> AsyncIterator[None]:
+                            async with user_on_ready():
+                                view.connect(connection)
+                                yield
+
+                        ready_callback = connect_view_when_ready
 
                     # run sandbox service
-                    return await run_human_agent_service(user, state, commands, view)
+                    return await run_human_agent_service(
+                        user, state, commands, view, ready_callback
+                    )
 
             # support both fullscreen ui and fallback
             if display_type() == "full":

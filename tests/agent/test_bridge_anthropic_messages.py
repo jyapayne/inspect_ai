@@ -223,7 +223,14 @@ async def _request_impl_messages(
     from inspect_ai.agent._agent import AgentState
     from inspect_ai.agent._bridge.types import AgentBridge
 
-    async def capture(bridge: Any, model: Any, messages: Any, *args: Any) -> Any:
+    async def capture(
+        bridge: Any,
+        model: Any,
+        messages: Any,
+        *args: Any,
+        requested_model: str | None = None,
+        metadata_headers: dict[str, str] | None = None,
+    ) -> Any:
         raise _CapturedMessages(messages)
 
     monkeypatch.setattr(impl, "bridge_generate", capture)

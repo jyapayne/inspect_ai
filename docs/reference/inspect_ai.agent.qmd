@@ -29,7 +29,11 @@ description: Agent scaffolds and protocol.
 ### agent_bridge
 ### AgentBridge
 ### sandbox_agent_bridge
+### sandbox_model_proxy
+### ModelProxy
+### ModelProxyError
 ### SandboxAgentBridge
+### StateFilter
 ### BridgedToolsSpec
 
 ## Filters
@@ -59,6 +63,8 @@ description: Agent scaffolds and protocol.
 ### AgentAttempts
 ### AgentContinue
 ### AgentSubmit
+### HumanAgentCommand
+### HumanAgentCommandsFilter
 
 ## Deprecated
 

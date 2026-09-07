@@ -9,7 +9,7 @@ from pydantic_core import to_jsonable_python
 from inspect_ai._util.exception import TerminateSampleError
 from inspect_ai._util.logger import warn_once
 from inspect_ai.agent._agent import AgentState
-from inspect_ai.agent._bridge.types import AgentBridge, DispatchedCall
+from inspect_ai.agent._bridge.types import AgentBridge, DispatchedCall, StateFilter
 from inspect_ai.model._call_tools import get_tools_info
 from inspect_ai.model._compaction.types import CompactionStrategy
 from inspect_ai.model._model import (
@@ -17,6 +17,7 @@ from inspect_ai.model._model import (
     Model,
     ModelEventSink,
     ModelResolver,
+    ModelResponseFilter,
 )
 from inspect_ai.tool import Tool
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
@@ -58,6 +59,10 @@ class SandboxAgentBridge(AgentBridge):
         allow_remote_mcp: bool = False,
         allow_remote_media: bool = False,
         model_resolver: ModelResolver | None = None,
+        model_event_metadata_headers: Sequence[str] | None = None,
+        response_filter: ModelResponseFilter | None = None,
+        state_filter: StateFilter | None = None,
+        accumulate_conversations: bool = False,
     ) -> None:
         super().__init__(
             state,
@@ -73,6 +78,10 @@ class SandboxAgentBridge(AgentBridge):
             allow_remote_mcp=allow_remote_mcp,
             allow_remote_media=allow_remote_media,
             model_resolver=model_resolver,
+            model_event_metadata_headers=model_event_metadata_headers,
+            response_filter=response_filter,
+            state_filter=state_filter,
+            accumulate_conversations=accumulate_conversations,
         )
         self.port = port
         self.mcp_server_configs = mcp_server_configs or []
@@ -210,14 +219,44 @@ class SandboxAgentBridge(AgentBridge):
         Arguments match by JSON semantics (`_json_equal`): key order and
         int/float numeric equality (`5 == 5.0`) don't matter, so a scaffold's
         JSON round-trip cannot turn a proposed call into a denial; any other
-        difference (including bool vs number) is denied.
+        difference (including bool vs number) is denied -- except a granted
+        key the served tool's own input schema does not declare, which is
+        dropped from the granted side before comparison.
+
+        A scaffold may propose bookkeeping fields alongside a tool's real
+        arguments that it never forwards when it actually dispatches the
+        call (Antigravity's `toolSummary` is the one observed in the wild).
+        Those fields are captured verbatim in the grant by
+        `register_tool_execution_grants`, so an executed call that
+        legitimately omits them would otherwise always be denied. Filtering
+        the grant down to the schema's declared `properties` before
+        comparison tolerates exactly that gap: every key the schema DOES
+        declare must still be equal and present on both sides, so an
+        executed argument that is absent, changed, or added beyond what the
+        schema declares still denies -- only an undeclared *granted* key can
+        be dropped. When the served tool is unknown here, or its schema
+        declares no properties at all, there is no declared set to filter
+        by, so this keeps today's exact comparison.
         """
+        schema = self.served_tools.get(_BridgedToolId(server=server, tool=tool))
+        declared_properties = (
+            schema.parameters.properties
+            if schema is not None
+            and schema.parameters.type == "object"
+            and schema.parameters.properties
+            else None
+        )
         for index, grant in enumerate(self._tool_execution_grants):
-            if (
-                grant.server == server
-                and grant.tool == tool
-                and _json_equal(grant.arguments, arguments)
-            ):
+            if grant.server != server or grant.tool != tool:
+                continue
+            granted_arguments = grant.arguments
+            if declared_properties is not None and isinstance(granted_arguments, dict):
+                granted_arguments = {
+                    key: value
+                    for key, value in granted_arguments.items()
+                    if key in declared_properties
+                }
+            if _json_equal(granted_arguments, arguments):
                 del self._tool_execution_grants[index]
                 return True
         return False
@@ -326,30 +365,40 @@ def _resolve_by_served_content(
 ) -> list[_BridgedToolId]:
     """The bridged tools a declaration denotes by what the bridge served for them.
 
-    The description is the key: the scaffolds forward the MCP description to
-    their models unchanged (verified per scaffold in the PR), so equality after
-    trimming whitespace identifies the tool whatever name it was given; an empty
-    description is matched like any other, so it identifies every bridged tool
-    served without one. Failing an exact match, a declaration that is a
-    truncation of a served description identifies it too
+    The description is the key: scaffolds forward the MCP description to their
+    models, so equality after trimming whitespace identifies the tool whatever
+    name it was given; an empty description is matched like any other, so it
+    identifies every bridged tool served without one. Failing an exact match, a
+    declaration that is a truncation of a served description identifies it too
     (`_is_truncation_of`), since a scaffold may cut a long description before
-    the model sees it. Schemas are not consulted: scaffolds rewrite them. Tools
-    that cannot be told apart are all returned, and the caller grants each. An
-    exact match wins even when that description is a prefix of another bridged
-    tool's; a truncated declaration which could refer to both denotes both.
+    the model sees it, and so does one that is a served description with a
+    short scaffold preamble in front (`_prefixed_copies`): Antigravity declares
+    every MCP tool as the sentence "This is a tool from the <server> MCP
+    server.", a blank line, then the description. Schemas are not consulted:
+    scaffolds rewrite them. Tools that cannot be told apart are all returned,
+    and the caller grants each. An exact match wins even when that description
+    is a prefix of another bridged tool's; a truncated declaration which could
+    refer to both denotes both; a prefixed declaration denotes only the tools
+    whose whole served description it ends with at the longest such length,
+    since a copy of a longer description is not also the shorter one it
+    happens to end with.
     """
     targets: list[_BridgedToolId] = []
     for declaration in declarations:
         description = declaration.description.strip()
-        matched = [
-            tool_id
-            for tool_id, info in served.items()
-            if info.description.strip() == description
-        ] or [
-            tool_id
-            for tool_id, info in served.items()
-            if _is_truncation_of(description, info.description.strip())
-        ]
+        matched = (
+            [
+                tool_id
+                for tool_id, info in served.items()
+                if info.description.strip() == description
+            ]
+            or [
+                tool_id
+                for tool_id, info in served.items()
+                if _is_truncation_of(description, info.description.strip())
+            ]
+            or _prefixed_copies(description, served)
+        )
         targets.extend(tool_id for tool_id in matched if tool_id not in targets)
     return targets
 
@@ -381,6 +430,52 @@ def _is_truncation_of(declared: str, served: str) -> bool:
     return (
         common >= _MIN_TRUNCATED_PREFIX
         and len(declared) - common <= _MAX_TRUNCATION_MARKER
+    )
+
+
+_MAX_SCAFFOLD_PREAMBLE = 96
+"""Longest text a scaffold is assumed to put in front of a served description.
+
+Antigravity's is the one known: the sentence "This is a tool from the <server>
+MCP server." and a blank line, 38 characters plus the server name, so 96
+allows a server name of up to 58 characters while keeping an accidental
+suffix match (a declaration that merely ends with another tool's description)
+bounded.
+"""
+
+
+def _prefixed_copies(
+    declared: str, served: dict[_BridgedToolId, ToolInfo]
+) -> list[_BridgedToolId]:
+    """The served tools whose whole description `declared` ends with, after a preamble.
+
+    Scaffold-agnostic: no scaffold's wording is looked for. A served description
+    qualifies when it is at least `_MIN_TRUNCATED_PREFIX` characters (so a short
+    description can never match as another tool's accidental suffix), `declared`
+    ends with all of it, and what stands in front is at most
+    `_MAX_SCAFFOLD_PREAMBLE` characters. Of the qualifying descriptions only the
+    longest are returned: a declaration carrying the whole of a longer served
+    description names that tool, not a shorter one whose description is the
+    longer one's tail. Two tools served the same description are both returned.
+    A scaffold that rewrites the description itself is not tolerated.
+    """
+    candidates = [
+        (len(info.description.strip()), tool_id)
+        for tool_id, info in served.items()
+        if _is_prefixed_copy_of(declared, info.description.strip())
+    ]
+    if not candidates:
+        return []
+    longest = max(length for length, _ in candidates)
+    return [tool_id for length, tool_id in candidates if length == longest]
+
+
+def _is_prefixed_copy_of(declared: str, served: str) -> bool:
+    """Whether `declared` is `served` with at most a scaffold preamble in front."""
+    return (
+        len(served) >= _MIN_TRUNCATED_PREFIX
+        and declared.endswith(served)
+        and 0 < len(declared) - len(served) <= _MAX_SCAFFOLD_PREAMBLE
     )
 
 

@@ -870,6 +870,25 @@ def _unroll_span(
         span: The non-agent EventTreeSpan to unroll.
         into: The content list to append results to.
     """
+    if span.type == "scorer":
+        # A scorer that ran mid-sample (a `score()` call from a human agent or a
+        # solver). Render it as scoring, exactly as the top-level scorers phase
+        # is, instead of dissolving it into the agent trajectory: unrolling would
+        # promote the scorer's own agent spans as the agent's sub-agents.
+        scoring_content: list[TimelineEvent | TimelineSpan] = [
+            TimelineEvent(event=e) for e in event_sequence(span.children)
+        ]
+        if scoring_content:
+            into.append(
+                TimelineSpan(
+                    id=span.id,
+                    name=span.name,
+                    span_type="scorers",
+                    content=scoring_content,
+                )
+            )
+        return
+
     # Emit span begin event
     into.append(TimelineEvent(event=span.begin))
 

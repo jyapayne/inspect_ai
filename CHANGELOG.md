@@ -5,6 +5,42 @@
 - Control Channel: `inspect ctl ... --log-dir` now shows running and completed-but-unflushed samples, with current counts and their events, for evals run with `--log-shared`.
 - OpenAI Compatible: Fixed concurrent sample failures during credential refresh, including OpenRouter evaluations on Hawk, and added an overridable `ModelAPI.refresh_credentials()` for model API extensions.
 - OpenAI: Biological-risk policy responses now produce content-filter stops instead of failing samples.
+- Sandbox: `exec_remote()` and `sandbox_agent_bridge()` take a new opt-in `poll_timeout_recovery` that keeps polling a running command through a temporary sandbox stall instead of failing.
+- Agent bridge: `fallbacks` directives from bridged agents now reach Anthropic models (a model list only when the agent's named model serves it), never other providers.
+- Agent Bridge: `state_filter` lets integrations select which bridged requests update canonical agent state.
+- Bridged agent transcripts now identify which model a request was for, and record output a generate filter produced.
+- Sandbox agent bridges can attach selected non-sensitive client request headers to their model events for external session attribution.
+- OpenAI: Native Responses agent messages now retain their optional identifiers during replay.
+- Agent Bridge: Native Anthropic Messages streams preserve provider message IDs and served models; bridged Codex Responses events retain root and collab-spawn thread lineage.
+- Agent Bridge: Client-supplied HTTP headers are now forwarded through the sandbox agent-bridge model proxy to the bridged model request.
+- Agent Bridge: A bridged client's `reasoning` options now reach the model request verbatim when forwarding generation config, preserving fields like `context` that were previously dropped.
+- Agent Bridge: Transparent bridged requests now decode Brotli responses when clients advertise `br` through `Accept-Encoding`.
+- Deep Agent: Background subagents now remain available while eval scorers run after the solver completes.
+- Timelines: A scorer run mid-sample (for example from a human agent's `score` command) now appears as a scoring span, not as one of the agent's sub-agents.
+- Agent Bridge: `sandbox_agent_bridge()` can now preserve every conversation a sandbox runs, instead of returning only one when the sandbox ran several.
+- Agent Bridge: each preserved conversation now appears as its own transcript span, so multi-conversation sessions read as separate threads instead of one flat list.
+- Agent Bridge: long sandbox sessions no longer slow to a halt, and sub-agent spans keep their conversation, once the transcript starts serving events from the sample buffer.
+- Logging: Reduced memory usage and event-loop stalls when finalizing long samples; hooks can opt out of receiving full event histories.
+- Docker: `--no-sandbox-cleanup` now lists each environment's cleanup command, and `inspect sandbox cleanup docker <project>` now removes custom networks declared in a `ComposeConfig`.
+- Tools: A tool argument a model fills with a value its schema allowed but the underlying type rejects is now returned as a retryable error instead of ending the sample.
+- Agent Bridge: A provider error delivered during a streamed response now reaches the bridged agent as an error instead of a malformed HTTP 200 success.
+- Anthropic: Forced web searches (`tool_choice` naming `web_search`) now work on Claude 4.6+ models, including bridged agents' web search.
+- Agent Bridge: A bridged Anthropic client now sees conflict, timeout, and billing errors as such instead of as generic server errors.
+- Docker: Sandboxes with healthchecks now allow 60 s of startup beyond the healthcheck estimate; a start that hangs, or a service still starting after that, can take up to about 150 s longer to fail (more on a loaded host).
+- Eval: added opt-in `INSPECT_GC_MODE=low_latency` to suppress automatic full collections during high-concurrency runs while retaining a cgroup-memory guard.
+- MCP: a sandboxed MCP server is now started once per sample instead of once per tool call, so an eval with many concurrent samples no longer spends most of its time on server startup and handshakes.
+- Task: added `sample_resources`, async context managers held open for a whole sample (entered once its sandbox exists, exited after scoring) — use it to pay for a per-sample connection or process once rather than per solver.
+- Bugfix: Structured output no longer fails with HTTP 400 on Anthropic when the response schema has an optional field, or on Bedrock when it has a nullable object typed `["object", "null"]`.
+- Agent Bridge: Sandboxed agents now receive exhausted provider errors with their original status and error details.
+- Transcript: New `Transcript.subscribe()` delivers each event to a callback as it is recorded, including a model event's full API request and response (subject to `log_model_api`).
+- Human Agent: `human_cli()` integrations can initialize operator tooling once task commands are ready, with cleanup tied to session completion.
+- Agent Bridge: Client-executed tool search can now expose discovered tools to model providers that do not use the OpenAI Responses API.
+- Human Agent: `human_cli()` now accepts a `commands_filter` option for tailoring the commands available in the human agent CLI.
+- Agent Bridge: `agent_bridge()` and `sandbox_agent_bridge()` now accept a `response_filter` for transforming model output before it is returned.
+- Agent Bridge: Side calls to a different model can no longer displace the tracked agent conversation, regardless of thread shape.
+- Bugfix: Interrupting after scoring no longer drops the scored sample from a cancelled evaluation log while its sandbox is being cleaned up.
+- Agent Bridge: Antigravity's MCP tool calls, proposed by the model, now execute instead of being denied as unproposed.
+- Agent Bridge: New `sandbox_model_proxy()` runs the sandbox agent bridge's in-sandbox model proxy with your own request handlers, for example to forward requests unchanged to a model gateway.
 
 ## 0.3.273 (29 September 2026)
 

@@ -856,8 +856,13 @@ class AnthropicAPI(ModelAPI):
 
             # add fallback beta header if the input contains fallback blocks
             # (so replayed blocks are accepted even if fallback_models is no
-            # longer configured, e.g. on a resumed eval with changed config)
-            if FALLBACK_BETA not in betas and _input_has_fallback(input):
+            # longer configured, e.g. on a resumed eval with changed config);
+            # either fallback beta accepts them
+            if (
+                FALLBACK_BETA not in betas
+                and FALLBACK_DEFAULT_BETA not in betas
+                and _input_has_fallback(input)
+            ):
                 betas.append(FALLBACK_BETA)
 
             # resolve betas and extra headers
@@ -893,10 +898,11 @@ class AnthropicAPI(ModelAPI):
                     request, streaming, tools, config
                 )
             except (BadRequestError, APIStatusError) as ex:
+                _normalize_stream_error(ex)
                 model_call.set_error(
                     as_error_response(ex.body), self._http_hooks.end_request(request_id)
                 )
-                raise ex
+                raise
 
             model_call.set_response(response, self._http_hooks.end_request(request_id))
 
@@ -1374,25 +1380,34 @@ class AnthropicAPI(ModelAPI):
 
         # server-side refusal fallback (first-party Claude API only). routed
         # via extra_body as the SDK only exposes `fallbacks` on
-        # client.beta.messages.create but inspect calls client.messages.create
+        # client.beta.messages.create but inspect calls client.messages.create.
+        # `fallback_models` takes precedence over a caller's verbatim `fallbacks`
+        # directive.
         if config.fallback_models:
+            fallbacks: Any = [{"model": model} for model in config.fallback_models]
+            fallback_source, fallback_beta = "fallback_models", FALLBACK_BETA
+        else:
+            fallbacks = (config.extra_body or {}).get(FALLBACKS_FIELD)
+            fallback_source, fallback_beta = (
+                "A `fallbacks` directive",
+                FALLBACK_DEFAULT_BETA,
+            )
+        if fallbacks is not None:
             if self.is_bedrock() or self.is_vertex() or self.is_azure():
                 warn_once(
                     logger,
-                    "fallback_models is only supported on the first-party "
+                    f"{fallback_source} is only supported on the first-party "
                     "Anthropic API (not bedrock/vertex/azure) and will be ignored.",
                 )
             elif normalized_batch_config(config.batch):
                 warn_once(
                     logger,
-                    "fallback_models is not supported with the Anthropic "
+                    f"{fallback_source} is not supported with the Anthropic "
                     "Batches API and will be ignored.",
                 )
             else:
-                betas.append(FALLBACK_BETA)
-                extra_body["fallbacks"] = [
-                    {"model": model} for model in config.fallback_models
-                ]
+                betas.append(fallback_beta)
+                extra_body[FALLBACKS_FIELD] = fallbacks
 
         # look for any of our native fields not in GenerateConfig in extra_body
         if config.extra_body is not None:
@@ -1817,21 +1832,16 @@ class AnthropicAPI(ModelAPI):
     @override
     def should_retry(self, ex: BaseException) -> bool | RetryDecision:
         if isinstance(ex, APIStatusError):
+            # A mid-stream SSE error event reaches here with the stream's 200
+            # status; give it its effective status first (a no-op once
+            # generate() has done so) so the status rules below classify it.
+            _normalize_stream_error(ex)
             retry_after = parse_retry_after_from_exception(ex)
-            # An error event delivered mid-stream surfaces as an
-            # APIStatusError with status_code == 200 (the SDK builds it from
-            # the SSE error body, not an HTTP status), so the status-based
-            # checks below can't classify it — classify from the body's
-            # error type: these are the in-band analogues of 429/529/500/408.
-            # Scoped to status 200 so that a real HTTP error status (e.g. a
-            # proxy's 4xx wrapping an anthropic-format body) keeps failing
-            # fast via the status rules.
-            if ex.status_code == 200 and isinstance(ex.body, dict):
-                error_type = _error_type_from_body(ex.body)
-                if error_type == "rate_limit_error":
-                    return RetryDecision.rate_limit(retry_after=retry_after)
-                if error_type in ("overloaded_error", "api_error", "timeout_error"):
-                    return RetryDecision.transient(retry_after=retry_after)
+            if ex.status_code == 429:
+                # The provider's own classification outranks any message text:
+                # a rate_limit_error whose message mentions overload is still a
+                # rate limit, and only that kind feeds adaptive concurrency.
+                return RetryDecision.rate_limit(retry_after=retry_after)
             if isinstance(ex.body, dict | str):
                 # message-based fallback for error bodies without a
                 # recognized type (a mid-stream error event whose data fails
@@ -1848,11 +1858,16 @@ class AnthropicAPI(ModelAPI):
                 ):
                     return RetryDecision.transient(retry_after=retry_after)
 
-            # standard http status code checking
+            if _is_unclassified_stream_error(ex):
+                # a mid-stream error this provider could not classify carries
+                # a 500 only so the failure is reported as one; nothing says
+                # it is transient, so it is not retried (as before normalization,
+                # when it kept the stream's 200 and fell through here)
+                return RetryDecision.no()
+
+            # standard http status code checking (429 was decided above)
             if not is_retryable_http_status(ex.status_code):
                 return RetryDecision.no()
-            if ex.status_code == 429:
-                return RetryDecision.rate_limit(retry_after=retry_after)
             return RetryDecision.transient(retry_after=retry_after)
 
         decision = httpx_classify_retry(ex)
@@ -2610,12 +2625,21 @@ def _web_search_tool_params(
     web_fetch_tool: BetaWebFetchTool20250910Param | BetaWebFetchTool20260209Param
     web_search_tool: WebSearchTool20250305Param | WebSearchTool20260209Param
     if web_search_filtering:
+        # The _20260209 versions default `allowed_callers` to the code execution
+        # caller only, so a request that forces the tool (`tool_choice` naming
+        # web_search, as Claude Code's WebSearch does) is rejected with a 400.
+        # Allow both callers: dynamic filtering stays available and the model can
+        # still be told to search directly. A caller-supplied `allowed_callers`
+        # (below) overrides this.
         web_fetch_tool = BetaWebFetchTool20260209Param(
-            name="web_fetch", type="web_fetch_20260209"
+            name="web_fetch",
+            type="web_fetch_20260209",
+            allowed_callers=["direct", "code_execution_20260120"],
         )
         web_search_tool = WebSearchTool20260209Param(
             name="web_search",
             type="web_search_20260209",
+            allowed_callers=["direct", "code_execution_20260120"],
         )
     else:
         web_fetch_tool = BetaWebFetchTool20250910Param(
@@ -2644,6 +2668,11 @@ def _web_search_tool_params(
             web_fetch_tool["max_uses"] = web_search_tool["max_uses"]
         if "user_location" in maybe_anthropic_options:
             web_search_tool["user_location"] = maybe_anthropic_options["user_location"]
+        if "allowed_callers" in maybe_anthropic_options:
+            web_search_tool["allowed_callers"] = maybe_anthropic_options[
+                "allowed_callers"
+            ]
+            web_fetch_tool["allowed_callers"] = web_search_tool["allowed_callers"]
 
         if "citations" in maybe_anthropic_options:
             web_fetch_tool["citations"] = maybe_anthropic_options["citations"]
@@ -4821,6 +4850,11 @@ EXTRA_BODY = "extra_body"
 CONTEXT_MANAGEMENT = "context_management"
 MIN_COMPACTION_TOKENS = 50000  # Anthropic API minimum trigger value
 FALLBACK_BETA = "server-side-fallback-2026-06-01"
+# The only fallback beta accepting `fallbacks: "default"` (server-defined
+# routing); FALLBACK_BETA accepts only the explicit-list form.
+FALLBACK_DEFAULT_BETA = "server-side-fallback-2026-07-01"
+# Request-body field carrying a server-side refusal fallback directive.
+FALLBACKS_FIELD = "fallbacks"
 
 
 def _add_edit_compaction(
@@ -5003,13 +5037,15 @@ def _warn_refusal_without_fallback(
 ) -> None:
     """Suggest fallback_models when a rescuable classifier refusal occurs.
 
-    Fires only when fallback could actually have been used: fallback_models
-    not configured, first-party non-batch API, and a Claude 5+ requested model
-    (the `fallbacks` param is only accepted for models publishing
-    allowed_fallback_models -- Opus 4.7/4.8 emit the same refusal stop_details
-    but cannot fall back).
+    Fires only when fallback could actually have been used: neither
+    fallback_models nor a caller's `fallbacks` directive configured, first-party
+    non-batch API, and a Claude 5+ requested model (the `fallbacks` param is
+    only accepted for models publishing allowed_fallback_models -- Opus 4.7/4.8
+    emit the same refusal stop_details but cannot fall back).
     """
     if config.fallback_models:
+        return
+    if (config.extra_body or {}).get(FALLBACKS_FIELD) is not None:
         return
     if api.is_bedrock() or api.is_vertex() or api.is_azure():
         return
@@ -5037,18 +5073,72 @@ def _warn_refusal_without_fallback(
     )
 
 
-def _error_type_from_body(body: dict[str, Any]) -> str | None:
-    """Extract the API error type from an error response body.
+# The HTTP status Anthropic sends with each error type on the Messages API. Batch
+# results classify some of these types differently (`_anthropic_batch.py`): a batch
+# result carries no HTTP response, so it borrows each SDK subclass's own status
+# (a billing error becomes a 403 PermissionDeniedError there). These are the wire
+# statuses, and the sandbox proxy's inverse table must invert exactly this one.
+_ANTHROPIC_ERROR_TYPE_STATUS = {
+    "invalid_request_error": 400,
+    "authentication_error": 401,
+    "billing_error": 402,
+    "permission_error": 403,
+    "not_found_error": 404,
+    "conflict_error": 409,
+    "request_too_large": 413,
+    "rate_limit_error": 429,
+    "api_error": 500,
+    "timeout_error": 504,
+    "overloaded_error": 529,
+}
 
-    The SDK attaches the full error envelope as `ex.body` — for both
-    mid-stream SSE error events and non-streaming HTTP errors —
-    ({"type": "error", "error": {"type": "rate_limit_error", ...}}).
+
+_UNCLASSIFIED_STREAM_ERROR_ATTR = "_inspect_unclassified_stream_error"
+
+
+def _normalize_stream_error(ex: APIStatusError) -> None:
+    """Give a mid-stream SSE error event its effective HTTP status and message.
+
+    The SDK raises `APIStatusError` for an SSE `error` event with the stream's
+    own status (200) and the event's data as `body`: the error envelope when it
+    parsed, the raw string when it did not. The real status is only implied by
+    the envelope's `type`. Rewrite the exception in place so every downstream
+    reader -- retry classification, bad-request handling, the agent bridge --
+    sees the status the provider meant.
+
+    A 200 here is never a success: the SDK raised, so the provider reported a
+    failure. An envelope whose type this table does not name, an envelope whose
+    `error` is not a mapping, and an undecodable body all become a 500 -- the
+    honest floor for an error we cannot classify -- rather than escaping as a
+    200 that a client would read as a (malformed) reply. Such an error is also
+    marked unclassified (see `_is_unclassified_stream_error`): the 500 is for
+    reporting, not a claim that the failure is transient, so retry
+    classification does not treat it as one. The body is left as the SDK
+    captured it so the diagnostic survives. A no-op on an ordinary HTTP error
+    or an already-normalized exception.
     """
-    error = body.get("error")
+    if ex.status_code != 200:
+        return
+    status: int | None = None
+    error = ex.body.get("error") if isinstance(ex.body, dict) else None
     if isinstance(error, dict):
         error_type = error.get("type")
-        return error_type if isinstance(error_type, str) else None
-    return None
+        if isinstance(error_type, str):
+            status = _ANTHROPIC_ERROR_TYPE_STATUS.get(error_type)
+        message = error.get("message")
+        if isinstance(message, str):
+            ex.message = message
+            ex.args = (message,)
+    if status is None:
+        status = 500
+        setattr(ex, _UNCLASSIFIED_STREAM_ERROR_ATTR, True)
+    ex.status_code = status
+    ex.response.status_code = status
+
+
+def _is_unclassified_stream_error(ex: APIStatusError) -> bool:
+    """Whether `_normalize_stream_error` could not classify this mid-stream error."""
+    return getattr(ex, _UNCLASSIFIED_STREAM_ERROR_ATTR, False) is True
 
 
 def _strip_reasoning(message: ChatMessageAssistant) -> ChatMessageAssistant:

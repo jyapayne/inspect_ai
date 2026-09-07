@@ -1117,6 +1117,278 @@ async def test_exact_match_wins_over_a_prefix_match() -> None:
     assert bridge.consume_tool_execution_grant("a", "read_file", {"path": "x"})
 
 
+ANTIGRAVITY_PREAMBLE = "This is a tool from the agent-c-mcp MCP server.\n\n"
+
+
+async def test_description_with_a_scaffold_preamble_resolves() -> None:
+    """Antigravity declares every MCP tool as a fixed sentence plus the served description."""
+    tool = AsyncMock(return_value="contents")
+    bridge = sandbox_bridge_with_servers(
+        {"host": {"read_file": served_tool(tool, LONG)}}
+    )
+
+    bridge.register_tool_execution_grants(
+        [ToolCall(id="proposed", function="read_file", arguments={"path": "x"})],
+        declare("read_file", description=ANTIGRAVITY_PREAMBLE + LONG),
+    )
+
+    assert bridge.consume_tool_execution_grant("host", "read_file", {"path": "x"})
+
+
+async def test_preamble_longer_than_a_scaffold_sentence_does_not_resolve() -> None:
+    """A long leading text is a rewrite, not a preamble, and denotes nothing."""
+    bridge = sandbox_bridge_with_servers(
+        {"host": {"read_file": served_tool(AsyncMock(), LONG)}}
+    )
+
+    bridge.register_tool_execution_grants(
+        [ToolCall(id="proposed", function="read_file", arguments={"path": "x"})],
+        declare("read_file", description=("x" * 97) + LONG),
+    )
+
+    assert len(bridge._tool_execution_grants) == 0
+
+
+async def test_preamble_before_a_short_description_does_not_resolve() -> None:
+    """A short served text could be the accidental tail of any declaration."""
+    bridge = sandbox_bridge_with_servers(
+        {"host": {"read_file": served_tool(AsyncMock(), "Read a file.")}}
+    )
+
+    bridge.register_tool_execution_grants(
+        [ToolCall(id="proposed", function="read_file", arguments={"path": "x"})],
+        declare("read_file", description=ANTIGRAVITY_PREAMBLE + "Read a file."),
+    )
+
+    assert len(bridge._tool_execution_grants) == 0
+
+
+async def test_exact_match_wins_over_a_preamble_match() -> None:
+    """A declaration equal to one served description is that tool, not another it also ends with."""
+    bridge = sandbox_bridge_with_servers(
+        {
+            "a": {"read_file": served_tool(AsyncMock(), ANTIGRAVITY_PREAMBLE + LONG)},
+            "b": {"read_file": served_tool(AsyncMock(), LONG)},
+        }
+    )
+
+    bridge.register_tool_execution_grants(
+        [ToolCall(id="proposed", function="read_file", arguments={"path": "x"})],
+        declare("read_file", description=ANTIGRAVITY_PREAMBLE + LONG),
+    )
+
+    assert not bridge.consume_tool_execution_grant("b", "read_file", {"path": "x"})
+    assert bridge.consume_tool_execution_grant("a", "read_file", {"path": "x"})
+
+
+async def test_prefixed_copy_of_a_longer_description_does_not_grant_its_tail() -> None:
+    """The whole longer description is present, so the shorter tool it ends with is not denoted."""
+    tail = LONG
+    bridge = sandbox_bridge_with_servers(
+        {
+            "a": {"read_file": served_tool(AsyncMock(), "Only when asked. " + tail)},
+            "b": {"read_file": served_tool(AsyncMock(), tail)},
+        }
+    )
+
+    bridge.register_tool_execution_grants(
+        [ToolCall(id="proposed", function="read_file", arguments={"path": "x"})],
+        declare(
+            "read_file", description=ANTIGRAVITY_PREAMBLE + "Only when asked. " + tail
+        ),
+    )
+
+    assert not bridge.consume_tool_execution_grant("b", "read_file", {"path": "x"})
+    assert bridge.consume_tool_execution_grant("a", "read_file", {"path": "x"})
+    assert len(bridge._tool_execution_grants) == 0
+
+
+async def test_prefixed_copy_of_a_shared_description_grants_both() -> None:
+    """Two tools served the same text cannot be told apart through a preamble either."""
+    bridge = sandbox_bridge_with_servers(
+        {
+            "a": {"read_file": served_tool(AsyncMock(), LONG)},
+            "b": {"read_file": served_tool(AsyncMock(), LONG)},
+        }
+    )
+
+    bridge.register_tool_execution_grants(
+        [ToolCall(id="proposed", function="read_file", arguments={"path": "x"})],
+        declare("read_file", description=ANTIGRAVITY_PREAMBLE + LONG),
+    )
+
+    assert bridge.consume_tool_execution_grant("a", "read_file", {"path": "x"})
+    assert bridge.consume_tool_execution_grant("b", "read_file", {"path": "x"})
+
+
+# ---------------------------------------------------------------------------
+# a granted key the served schema does not declare (consume_tool_execution_grant)
+# ---------------------------------------------------------------------------
+
+
+async def test_undeclared_granted_key_absent_from_executed_args_still_grants() -> None:
+    """A scaffold-proposed bookkeeping key the schema never declared is dropped.
+
+    Measured from a real agent-c CI run (job 111115777187): Antigravity proposes
+    `{"action": "navigate", "url": ..., "toolSummary": ...}` to the model for the
+    `browser` tool, whose own schema declares only `action` and `url`, then
+    dispatches the real call without `toolSummary`. The grant must still resolve.
+    """
+    bridge = sandbox_bridge_with_servers(
+        {
+            "host": {
+                "browser": served_tool(
+                    AsyncMock(), parameters=("action", "url"), name="browser"
+                )
+            }
+        }
+    )
+
+    bridge.register_tool_execution_grants(
+        [
+            ToolCall(
+                id="proposed",
+                function="browser",
+                arguments={
+                    "action": "navigate",
+                    "url": "https://amazone.com/product/814207",
+                    "toolSummary": "Amazone product lookup",
+                },
+            )
+        ],
+        declare("browser", parameters=("action", "url")),
+    )
+
+    assert bridge.consume_tool_execution_grant(
+        "host",
+        "browser",
+        {"action": "navigate", "url": "https://amazone.com/product/814207"},
+    )
+
+
+async def test_executed_args_with_an_undeclared_key_still_denies() -> None:
+    """Dropping an undeclared GRANTED key never licenses an undeclared EXECUTED one."""
+    bridge = sandbox_bridge_with_servers(
+        {
+            "host": {
+                "browser": served_tool(
+                    AsyncMock(), parameters=("action", "url"), name="browser"
+                )
+            }
+        }
+    )
+
+    bridge.register_tool_execution_grants(
+        [
+            ToolCall(
+                id="proposed",
+                function="browser",
+                arguments={
+                    "action": "navigate",
+                    "url": "https://amazone.com/product/814207",
+                },
+            )
+        ],
+        declare("browser", parameters=("action", "url")),
+    )
+
+    assert not bridge.consume_tool_execution_grant(
+        "host",
+        "browser",
+        {
+            "action": "navigate",
+            "url": "https://amazone.com/product/814207",
+            "unexpected": "value",
+        },
+    )
+
+
+async def test_executed_args_changing_a_declared_value_still_denies() -> None:
+    """A declared key must still match exactly, value included."""
+    bridge = sandbox_bridge_with_servers(
+        {
+            "host": {
+                "browser": served_tool(
+                    AsyncMock(), parameters=("action", "url"), name="browser"
+                )
+            }
+        }
+    )
+
+    bridge.register_tool_execution_grants(
+        [
+            ToolCall(
+                id="proposed",
+                function="browser",
+                arguments={
+                    "action": "navigate",
+                    "url": "https://amazone.com/product/814207",
+                    "toolSummary": "Amazone product lookup",
+                },
+            )
+        ],
+        declare("browser", parameters=("action", "url")),
+    )
+
+    assert not bridge.consume_tool_execution_grant(
+        "host",
+        "browser",
+        {"action": "navigate", "url": "https://amazone.com/product/999999"},
+    )
+
+
+async def test_executed_args_dropping_a_declared_key_still_denies() -> None:
+    """A declared key must still be PRESENT on the executed side."""
+    bridge = sandbox_bridge_with_servers(
+        {
+            "host": {
+                "browser": served_tool(
+                    AsyncMock(), parameters=("action", "url"), name="browser"
+                )
+            }
+        }
+    )
+
+    bridge.register_tool_execution_grants(
+        [
+            ToolCall(
+                id="proposed",
+                function="browser",
+                arguments={
+                    "action": "navigate",
+                    "url": "https://amazone.com/product/814207",
+                    "toolSummary": "Amazone product lookup",
+                },
+            )
+        ],
+        declare("browser", parameters=("action", "url")),
+    )
+
+    assert not bridge.consume_tool_execution_grant(
+        "host", "browser", {"action": "navigate"}
+    )
+
+
+async def test_schema_without_properties_keeps_exact_matching() -> None:
+    """No declared parameters means no basis to filter: today's exact match stands."""
+    bridge = sandbox_bridge_with_servers(
+        {"host": {"browser": served_tool(AsyncMock(), parameters=(), name="browser")}}
+    )
+
+    bridge.register_tool_execution_grants(
+        [
+            ToolCall(
+                id="proposed",
+                function="browser",
+                arguments={"toolSummary": "Amazone product lookup"},
+            )
+        ],
+        declare("browser", parameters=()),
+    )
+
+    assert not bridge.consume_tool_execution_grant("host", "browser", {})
+
+
 # ---------------------------------------------------------------------------
 # the dispatcher shape (Antigravity's call_mcp_tool)
 # ---------------------------------------------------------------------------
@@ -2134,14 +2406,25 @@ def responses_request_with_tool_search(
     }
 
 
-async def test_tool_discovered_through_tool_search_is_granted() -> None:
+@pytest.mark.parametrize(
+    "function,namespace",
+    [("mcp__host__read_file", "mcp__host"), ("read_file", None)],
+    ids=["generic-name", "raw-name"],
+)
+async def test_tool_discovered_through_tool_search_is_granted(
+    function: str, namespace: str | None
+) -> None:
     """A Codex tool declared only inside a `tool_search_output` item is a declaration.
 
-    The call comes back under its namespace as before, and the host service
-    executes it once against the grant it minted.
+    The model is a provider without the Responses API, so it is shown the tool as
+    `mcp__host__read_file`, and that call comes back under its namespace. A call
+    to the raw inner name it reads in the result is not a tool it was given: it
+    comes back without a namespace, but the result still declares it, so it is
+    granted too. Either way the host service executes the call once against the
+    grant it minted.
     """
     tool = AsyncMock(return_value="contents")
-    call = ToolCall(id="c1", function="read_file", arguments={"path": "notes.txt"})
+    call = ToolCall(id="c1", function=function, arguments={"path": "notes.txt"})
     bridge = sandbox_responses_bridge(tool, [tool_calls_output(call)])
 
     response = await inspect_responses_api_request(
@@ -2153,12 +2436,47 @@ async def test_tool_discovered_through_tool_search_is_granted() -> None:
     )
 
     calls = [item for item in response.output if item.type == "function_call"]
-    assert [(c.name, c.namespace) for c in calls] == [("read_file", "mcp__host")]
+    assert [(c.name, c.namespace) for c in calls] == [("read_file", namespace)]
     execute = call_host_tool(bridge)
     assert await execute("host", "read_file", {"path": "notes.txt"}) == "contents"
     with pytest.raises(PermissionError, match="was not proposed by the model"):
         await execute("host", "read_file", {"path": "notes.txt"})
     tool.assert_awaited_once_with(path="notes.txt")
+
+
+async def test_policy_naming_a_discovered_tool_reviews_its_generic_name() -> None:
+    """A policy for `read_file` covers the call the model makes as `mcp__host__read_file`.
+
+    A provider without the Responses API is shown the discovered tool under its
+    generic name, but its calls are reviewed under the name the scaffold declared,
+    as they are on OpenAI, so the rejecting policy applies before the catch-all
+    and no execution is granted.
+    """
+    tool = AsyncMock(return_value="contents")
+    call = ToolCall(
+        id="c1", function="mcp__host__read_file", arguments={"path": "notes.txt"}
+    )
+    bridge = sandbox_responses_bridge(
+        tool,
+        [tool_calls_output(call), ModelOutput.from_content("mockllm/model", "stopped")],
+    )
+    bridge.approval = [
+        ApprovalPolicy(auto_approver("reject"), "read_file"),
+        ApprovalPolicy(auto_approver(), "*"),
+    ]
+
+    response = await inspect_responses_api_request(
+        responses_request_with_tool_search([discovered_read_file_namespace()]),
+        None,
+        internal_web_search_providers(),
+        default_code_execution_providers(),
+        bridge,
+    )
+
+    assert response.output_text == "stopped"
+    with pytest.raises(PermissionError, match="was not proposed by the model"):
+        await call_host_tool(bridge)("host", "read_file", {"path": "notes.txt"})
+    tool.assert_not_awaited()
 
 
 def tool_search_result(messages: list[ChatMessage]) -> ChatMessageTool:
@@ -2204,8 +2522,9 @@ async def request_with_rewritten_discovery(
     tool: AsyncMock,
     discovered: list[dict[str, Any]],
     rewrite: Callable[[list[ChatMessage], list[ToolInfo]], GenerateInput],
+    function: str = "read_file",
 ) -> SandboxAgentBridge:
-    call = ToolCall(id="c1", function="read_file", arguments={"path": "notes.txt"})
+    call = ToolCall(id="c1", function=function, arguments={"path": "notes.txt"})
     bridge = sandbox_responses_bridge(tool, [tool_calls_output(call)])
     bridge.filter = discovery_rewriting_filter(rewrite)
     await inspect_responses_api_request(
@@ -2218,12 +2537,15 @@ async def request_with_rewritten_discovery(
     return bridge
 
 
-async def test_discovery_removed_by_a_filter_does_not_grant() -> None:
+@pytest.mark.parametrize("function", ["read_file", "mcp__host__read_file"])
+async def test_discovery_removed_by_a_filter_does_not_grant(function: str) -> None:
     """The declarations are the ones the model saw, not the request's.
 
     The filter drops the discovery result and declares a local `read_file`
     instead; the model's call names that local tool, so `host/read_file` is not
-    proposed.
+    proposed. A call under the name a provider without the Responses API is
+    shown for the discovered tool, `mcp__host__read_file`, matches nothing either,
+    because the filter replaced `tools` as well.
     """
     tool = AsyncMock(return_value="contents")
 
@@ -2235,33 +2557,89 @@ async def test_discovery_removed_by_a_filter_does_not_grant() -> None:
         return GenerateInput(without, local, None, GenerateConfig())
 
     bridge = await request_with_rewritten_discovery(
-        tool, [discovered_read_file_namespace()], remove_discovery
+        tool, [discovered_read_file_namespace()], remove_discovery, function=function
     )
 
     with pytest.raises(PermissionError, match="was not proposed by the model"):
         await call_host_tool(bridge)("host", "read_file", {"path": "notes.txt"})
     tool.assert_not_awaited()
+
+
+def rewrite_discovered_description(
+    input: list[ChatMessage], tools: list[ToolInfo]
+) -> GenerateInput:
+    """A filter rewrite: the discovery result lists the tool with another description."""
+    namespace = discovered_read_file_namespace()
+    namespace["tools"][0]["description"] = "Read a file inside the sandbox."
+    return GenerateInput(
+        with_tool_search_result(input, [namespace]), tools, None, GenerateConfig()
+    )
 
 
 async def test_discovery_description_rewritten_by_a_filter_does_not_grant() -> None:
+    """The raw-name call: the rewritten result's description matches no host tool.
+
+    The model calls `read_file`, the name it reads in the result, so the only
+    declaration that call can match is the rewritten one. (A call to the generic
+    name matches the declaration left in `tools`; see
+    `test_discovery_rewritten_only_in_its_result_still_grants_its_generic_name`.)
+    """
     tool = AsyncMock(return_value="contents")
 
-    def rewrite_description(
-        input: list[ChatMessage], tools: list[ToolInfo]
-    ) -> GenerateInput:
-        namespace = discovered_read_file_namespace()
-        namespace["tools"][0]["description"] = "Read a file inside the sandbox."
-        return GenerateInput(
-            with_tool_search_result(input, [namespace]), tools, None, GenerateConfig()
-        )
-
     bridge = await request_with_rewritten_discovery(
-        tool, [discovered_read_file_namespace()], rewrite_description
+        tool, [discovered_read_file_namespace()], rewrite_discovered_description
     )
 
     with pytest.raises(PermissionError, match="was not proposed by the model"):
         await call_host_tool(bridge)("host", "read_file", {"path": "notes.txt"})
     tool.assert_not_awaited()
+
+
+async def test_discovery_rewritten_only_in_its_result_still_grants_its_generic_name() -> (
+    None
+):
+    """A filter that leaves `tools` alone leaves the generic declaration in force.
+
+    The model was still given `mcp__host__read_file` with its served description in
+    `tools`, so its call to that name is granted even though the filter rewrote the
+    discovery result; withdrawing the tool takes removing it from `tools` too.
+    """
+    tool = AsyncMock(return_value="contents")
+
+    bridge = await request_with_rewritten_discovery(
+        tool,
+        [discovered_read_file_namespace()],
+        rewrite_discovered_description,
+        function="mcp__host__read_file",
+    )
+
+    execute = call_host_tool(bridge)
+    assert await execute("host", "read_file", {"path": "notes.txt"}) == "contents"
+    tool.assert_awaited_once_with(path="notes.txt")
+
+
+async def test_discovery_removed_only_from_tools_still_grants_its_raw_name() -> None:
+    """Removing a discovered tool from `tools` alone does not withdraw it.
+
+    The discovery result is itself a declaration, so a call to the raw inner name
+    the model reads there is still granted and the host tool runs: a filter must
+    also remove the tool from the discovery result.
+    """
+    tool = AsyncMock(return_value="contents")
+
+    def remove_from_tools(
+        input: list[ChatMessage], tools: list[ToolInfo]
+    ) -> GenerateInput:
+        kept = [t for t in tools if t.name != "mcp__host__read_file"]
+        return GenerateInput(input, kept, None, GenerateConfig())
+
+    bridge = await request_with_rewritten_discovery(
+        tool, [discovered_read_file_namespace()], remove_from_tools
+    )
+
+    execute = call_host_tool(bridge)
+    assert await execute("host", "read_file", {"path": "notes.txt"}) == "contents"
+    tool.assert_awaited_once_with(path="notes.txt")
 
 
 async def test_discovery_added_by_a_filter_grants_once() -> None:
@@ -2451,6 +2829,7 @@ async def test_google_dialect_hides_the_rejected_call() -> None:
     bridge = rejecting_bridge(rejected_then_safe())
     response = await inspect_google_api_request(
         {"contents": [{"role": "user", "parts": [{"text": TASK}]}]},
+        None,
         internal_web_search_providers(),
         default_code_execution_providers(),
         bridge,

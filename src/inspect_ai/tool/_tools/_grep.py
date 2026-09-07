@@ -10,6 +10,8 @@ def grep(
     timeout: int | None = None,
     user: str | None = None,
     sandbox: str | None = None,
+    *,
+    cwd: str | None = None,
 ) -> Tool:
     """Read-only text search tool.
 
@@ -19,6 +21,8 @@ def grep(
         timeout: Timeout (in seconds) for search.
         user: User to execute as.
         sandbox: Optional sandbox environment name.
+        cwd: Current working directory for sandbox execution. If None, uses the
+            sandbox provider's default working directory.
     """
 
     async def execute(
@@ -64,7 +68,9 @@ def grep(
             cmd.append("-c")
         cmd.extend(["--", pattern, path])
 
-        result = await sandbox_env(sandbox).exec(cmd=cmd, timeout=timeout, user=user)
+        result = await sandbox_env(sandbox).exec(
+            cmd=cmd, cwd=cwd, timeout=timeout, user=user
+        )
 
         # exit code 1 means no matches (not an error)
         if result.returncode == 1:

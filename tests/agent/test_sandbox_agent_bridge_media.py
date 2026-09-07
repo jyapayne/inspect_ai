@@ -1,5 +1,6 @@
 import asyncio
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -7,11 +8,25 @@ import pytest
 from test_helpers.utils import skip_if_no_docker
 
 from inspect_ai import Task, eval
-from inspect_ai.agent import sandbox_agent_bridge
+from inspect_ai.agent import StateFilter, sandbox_agent_bridge
 from inspect_ai.dataset import Sample
-from inspect_ai.model import GenerateConfig, get_model
-from inspect_ai.solver import Solver, solver
+from inspect_ai.model import ChatMessage, GenerateConfig, ModelOutput, get_model
+from inspect_ai.solver import Generate, Solver, TaskState, solver
 from inspect_ai.util import sandbox
+
+
+class _CollectingSink:
+    """ModelEventSink that retains bridged event pairs for assertions."""
+
+    def __init__(self) -> None:
+        self.pending: list[object] = []
+        self.complete: list[object] = []
+
+    def on_pending(self, event: object) -> None:
+        self.pending.append(event)
+
+    def on_complete(self, event: object) -> None:
+        self.complete.append(event)
 
 
 @skip_if_no_docker
@@ -107,3 +122,278 @@ def test_sandbox_bridge_cannot_read_host_media(tmp_path: Path) -> None:
         assert secret_bytes.decode() not in serialized_requests
     finally:
         asyncio.run(target_model.api.aclose())
+
+
+@skip_if_no_docker
+@pytest.mark.slow
+def test_sandbox_bridge_does_not_forward_metadata_headers_to_provider(
+    tmp_path: Path,
+) -> None:
+    """Native session attribution stays out of the provider request."""
+    provider_requests: list[dict[str, Any]] = []
+    target_model = get_model(
+        "openai/gpt-5",
+        api_key="local-fake-key",
+        base_url="http://127.0.0.1:9/v1",
+        memoize=False,
+        responses_api=False,
+    )
+
+    async def capture_create(**kwargs: Any) -> None:
+        provider_requests.append(kwargs)
+        raise RuntimeError("Stop after capturing provider request.")
+
+    cast(Any, target_model.api).client.chat.completions.create = capture_create
+
+    @solver
+    def bridge_solver() -> Solver:
+        async def solve(state, generate):
+            del generate
+            async with sandbox_agent_bridge(
+                model_aliases={"inspect": target_model},
+                model_event_metadata_headers=("x-opencode-session",),
+            ) as bridge:
+                script = (
+                    "import urllib.error, urllib.request\n"
+                    'body = b\'{"model":"inspect","messages":[{"role":"user","content":"hi"}]}\'\n'
+                    "request = urllib.request.Request(\n"
+                    f"    'http://127.0.0.1:{bridge.port}/v1/chat/completions',\n"
+                    "    data=body,\n"
+                    "    headers={\n"
+                    "        'Content-Type': 'application/json',\n"
+                    "        'X-OpenCode-Session': 'native-session',\n"
+                    "    },\n"
+                    "    method='POST',\n"
+                    ")\n"
+                    "try:\n"
+                    "    print(urllib.request.urlopen(request).read().decode())\n"
+                    "except urllib.error.HTTPError as ex:\n"
+                    "    print(ex.read().decode())\n"
+                )
+                await sandbox().write_file("bridge_metadata_provider_test.py", script)
+                result = await sandbox().exec(
+                    ["python3", "bridge_metadata_provider_test.py"], timeout=60
+                )
+                state.metadata["bridge_stdout"] = result.stdout
+                state.metadata["bridge_stderr"] = result.stderr
+            return state
+
+        return solve
+
+    logs = eval(
+        Task(
+            dataset=[Sample(id="sample", input="test")],
+            solver=bridge_solver(),
+            sandbox="docker",
+        ),
+        model="mockllm/model",
+        display="none",
+        log_dir=str(tmp_path / "logs"),
+    )
+
+    try:
+        assert logs[0].status == "success"
+        assert provider_requests
+        provider_headers = provider_requests[0].get("extra_headers") or {}
+        assert "x-opencode-session" not in provider_headers
+    finally:
+        asyncio.run(target_model.api.aclose())
+
+
+@skip_if_no_docker
+@pytest.mark.slow
+def test_sandbox_bridge_scopes_allowlisted_headers_to_model_events(
+    tmp_path: Path,
+) -> None:
+    """Scripted concurrent HTTP requests preserve only selected headers per event."""
+    from inspect_ai.model import (
+        BRIDGE_FILTER_SYNTHETIC,
+        BRIDGE_REQUEST_HEADERS,
+        ModelOutput,
+    )
+
+    sink = _CollectingSink()
+    target_model = get_model("mockllm/model")
+
+    async def header_filter(
+        model: object,
+        input: Sequence[Any],
+        tools: object,
+        tool_choice: object,
+        config: GenerateConfig,
+    ) -> ModelOutput | None:
+        del model, tools, tool_choice, config
+        if input and getattr(input[-1], "text", None) == "filter request":
+            return ModelOutput.from_content("mockllm/model", "filter output")
+        return None
+
+    @solver
+    def bridge_solver() -> Solver:
+        async def solve(state, generate):
+            del generate
+            async with sandbox_agent_bridge(
+                model_aliases={"inspect": target_model},
+                filter=header_filter,
+                model_event_sink=sink,
+                model_event_metadata_headers=(
+                    "x-opencode-session",
+                    "x-session-id",
+                    "x-parent-session-id",
+                ),
+            ) as bridge:
+                script = (
+                    "import json\n"
+                    "from concurrent.futures import ThreadPoolExecutor\n"
+                    "from urllib.request import Request, urlopen\n"
+                    f"url = 'http://127.0.0.1:{bridge.port}/v1/chat/completions'\n"
+                    "def post(request_data):\n"
+                    "    body = json.dumps({\n"
+                    "        'model': 'inspect',\n"
+                    "        'messages': [{'role': 'user', 'content': request_data['content']}],\n"
+                    "    }).encode()\n"
+                    "    request = Request(url, data=body, headers=request_data['headers'], method='POST')\n"
+                    "    with urlopen(request) as response:\n"
+                    "        return json.loads(response.read())['choices'][0]['message']['content']\n"
+                    "requests = [\n"
+                    "    {\n"
+                    "        'content': 'provider request',\n"
+                    "        'headers': {\n"
+                    "            'Content-Type': 'application/json',\n"
+                    "            'X-OpenCode-Session': 'provider-session',\n"
+                    "            'X-Parent-Session-Id': 'provider-parent',\n"
+                    "            'Authorization': 'Bearer must-not-record',\n"
+                    "            'X-Unselected': 'must-not-record',\n"
+                    "        },\n"
+                    "    },\n"
+                    "    {\n"
+                    "        'content': 'filter request',\n"
+                    "        'headers': {\n"
+                    "            'Content-Type': 'application/json',\n"
+                    "            'X-Session-Id': 'filter',\n"
+                    "            'X-Parent-Session-Id': 'filter-parent',\n"
+                    "            'Cookie': 'must-not-record',\n"
+                    "            'X-Unselected': 'must-not-record',\n"
+                    "        },\n"
+                    "    },\n"
+                    "]\n"
+                    "with ThreadPoolExecutor(max_workers=2) as executor:\n"
+                    "    print(json.dumps(list(executor.map(post, requests))))\n"
+                )
+                await sandbox().write_file("bridge_metadata_test.py", script)
+                result = await sandbox().exec(
+                    ["python3", "bridge_metadata_test.py"], timeout=60
+                )
+                state.metadata["bridge_stdout"] = result.stdout
+                state.metadata["bridge_stderr"] = result.stderr
+            return state
+
+        return solve
+
+    logs = eval(
+        Task(
+            dataset=[Sample(id="sample", input="test")],
+            solver=bridge_solver(),
+            sandbox="docker",
+        ),
+        model="mockllm/model",
+        display="none",
+        log_dir=str(tmp_path / "logs"),
+    )
+
+    assert logs[0].status == "success"
+    assert logs[0].samples is not None
+    assert "filter output" in logs[0].samples[0].metadata["bridge_stdout"]
+    assert len(sink.pending) == 2
+    assert len(sink.complete) == 2
+    event_metadata = [getattr(event, "metadata", None) or {} for event in sink.complete]
+    headers_by_session = {
+        metadata[BRIDGE_REQUEST_HEADERS].get(
+            "x-opencode-session", metadata[BRIDGE_REQUEST_HEADERS].get("x-session-id")
+        ): metadata
+        for metadata in event_metadata
+    }
+    assert headers_by_session["provider-session"][BRIDGE_REQUEST_HEADERS] == {
+        "x-opencode-session": "provider-session",
+        "x-parent-session-id": "provider-parent",
+    }
+    assert headers_by_session["filter"][BRIDGE_REQUEST_HEADERS] == {
+        "x-session-id": "filter",
+        "x-parent-session-id": "filter-parent",
+    }
+    assert headers_by_session["filter"][BRIDGE_FILTER_SYNTHETIC] is True
+
+
+@skip_if_no_docker
+@pytest.mark.slow
+def test_sandbox_agent_bridge_forwards_state_filter(tmp_path: Path) -> None:
+    """Filtered requests respond normally without replacing canonical state."""
+
+    def accepts_main(messages: Sequence[ChatMessage]) -> bool:
+        return messages[-1].text != "auxiliary"
+
+    state_filter: StateFilter = accepts_main
+
+    @solver
+    def bridge_solver() -> Solver:
+        async def solve(state: TaskState, generate: Generate) -> TaskState:
+            async with sandbox_agent_bridge(state_filter=state_filter) as bridge:
+                requests = [
+                    [{"role": "user", "content": "test"}],
+                    [
+                        {"role": "user", "content": "test"},
+                        {"role": "assistant", "content": "retained reply"},
+                        {"role": "user", "content": "auxiliary"},
+                    ],
+                ]
+                script = (
+                    "import json, urllib.error, urllib.request\n"
+                    "responses = []\n"
+                    f"for messages in {requests!r}:\n"
+                    "    request = urllib.request.Request(\n"
+                    f"        'http://127.0.0.1:{bridge.port}/v1/chat/completions',\n"
+                    "        data=json.dumps({'model': 'inspect', 'messages': messages}).encode(),\n"
+                    "        headers={'Content-Type': 'application/json'},\n"
+                    "    )\n"
+                    "    try:\n"
+                    "        with urllib.request.urlopen(request, timeout=30) as response:\n"
+                    "            responses.append(json.load(response))\n"
+                    "    except urllib.error.HTTPError as ex:\n"
+                    "        raise RuntimeError(ex.read().decode()) from ex\n"
+                    "print(json.dumps(responses))\n"
+                )
+                result = await sandbox().exec(["python3", "-c", script], timeout=60)
+                assert result.success, result.stderr
+                state.metadata["responses"] = json.loads(result.stdout)
+                state.messages = bridge.state.messages
+                state.output = bridge.state.output
+            return state
+
+        return solve
+
+    logs = eval(
+        Task(
+            dataset=[Sample(id="sample", input="test")],
+            solver=bridge_solver(),
+            sandbox="docker",
+        ),
+        model=get_model(
+            "mockllm/model",
+            custom_outputs=[
+                ModelOutput.from_content(model="mockllm/model", content=reply)
+                for reply in ("retained reply", "auxiliary reply")
+            ],
+            memoize=False,
+        ),
+        display="none",
+        log_dir=str(tmp_path / "logs"),
+    )
+
+    assert logs[0].status == "success", logs[0].error
+    assert logs[0].samples is not None
+    sample = logs[0].samples[0]
+    assert [
+        response["choices"][0]["message"]["content"]
+        for response in sample.metadata["responses"]
+    ] == ["retained reply", "auxiliary reply"]
+    assert [message.text for message in sample.messages] == ["test", "retained reply"]
+    assert sample.output.completion == "retained reply"
