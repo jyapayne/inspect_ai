@@ -30,6 +30,7 @@ description: Agent scaffolds and protocol.
 ### AgentBridge
 ### sandbox_agent_bridge
 ### SandboxAgentBridge
+### StateFilter
 ### BridgedToolsSpec
 
 ## Filters
@@ -59,6 +60,8 @@ description: Agent scaffolds and protocol.
 ### AgentAttempts
 ### AgentContinue
 ### AgentSubmit
+### HumanAgentCommand
+### HumanAgentCommandsFilter
 
 ## Deprecated
 

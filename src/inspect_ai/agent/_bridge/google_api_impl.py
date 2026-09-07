@@ -68,9 +68,12 @@ logger = getLogger(__name__)
 
 async def inspect_google_api_request_impl(
     json_data: dict[str, Any],
+    headers: dict[str, str] | None,
     web_search_providers: WebSearchProviders | None,
     code_execution_providers: CodeExecutionProviders | None,
     bridge: AgentBridge,
+    *,
+    metadata_headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     # resolve model
     bridge_model_name = str(json_data.get("model", "inspect"))
@@ -127,6 +130,7 @@ async def inspect_google_api_request_impl(
     if not bridge.forward_generation_config:
         clear_generation_params(config)
     validate_client_config(config)
+    config.extra_headers = headers
 
     # try to maintain id stability
     apply_message_ids(bridge, messages)
@@ -136,7 +140,14 @@ async def inspect_google_api_request_impl(
 
     # generate via bridge
     output, c_message = await bridge_generate(
-        bridge, model, messages, tools, tool_choice, config
+        bridge,
+        model,
+        messages,
+        tools,
+        tool_choice,
+        config,
+        requested_model=bridge_model_name,
+        metadata_headers=metadata_headers,
     )
     if c_message is not None:
         messages.append(c_message)
@@ -144,7 +155,7 @@ async def inspect_google_api_request_impl(
     debug_log("INSPECT OUTPUT", output.message)
 
     # update state if we have more messages than the last generation
-    await bridge._track_state(messages, output)
+    await bridge._track_state(messages, output, str(ModelName(model)))
 
     # translate response to Gemini format
     response = gemini_response_from_output(output, model.api.model_name)

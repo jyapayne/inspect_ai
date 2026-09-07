@@ -16,6 +16,7 @@ from typing import (
     AsyncIterator,
     Awaitable,
     Callable,
+    Final,
     Iterator,
     Literal,
     Mapping,
@@ -1982,6 +1983,7 @@ class Model:
             cache=cache,
             call=call,
             pending=output is None,
+            metadata=model_event_metadata(),
         )
         sink = _model_event_sink.get()
         if sink is None:
@@ -2084,6 +2086,54 @@ name is first qualified by that provider, so the resolver receives e.g.
 ``openai/gpt-5.1`` rather than a bare ``gpt-5.1``. Lets a bridge express a routing
 *policy* (e.g. route every request to the model under test) without enumerating
 every possible model name as an alias.
+"""
+
+
+ModelResponseFilter: TypeAlias = Callable[
+    [
+        Model,
+        ModelOutput,
+        list[ChatMessage],
+        list[ToolInfo],
+        ToolChoice | None,
+        GenerateConfig,
+    ],
+    Awaitable[ModelOutput | None],
+]
+"""Filter that mutates a model's output after generation.
+
+Called inside the bridge's refusal-retry loop, after ``model.generate()``
+returns and after the compaction baseline is updated from that call's
+actual usage. Receives the resolved ``Model``, the ``ModelOutput``
+returned by ``model.generate()``, and the same input arguments that were
+sent to the model.
+
+Return a ``ModelOutput`` to replace the response, or ``None`` to pass
+through unchanged. Returning an output with ``stop_reason="content_filter"``
+triggers a refusal retry (subject to ``bridge.retry_refusals``); returning
+one with any other ``stop_reason`` completes the turn.
+
+Note: mutations to the returned ``ModelOutput`` propagate into bridge state
+and into the assistant history sent to the model on subsequent turns. If a
+filter mutates ``output.message.tool_calls[*].arguments`` (for example, to
+rewrite tool inputs before execution), callers that want the model to see a
+consistent view across turns should apply a symmetric inverse mutation in
+the request ``filter`` so the assistant history visible to the model on the
+next turn matches what the model originally emitted. Filters that only
+substitute outputs without depending on cross-turn consistency do not need
+this symmetric setup.
+
+Recording: the ``ModelEvent`` emitted by ``model.generate()`` keeps the
+model's original output (it is evidence of what the model actually produced),
+while the filtered output is what enters bridge state and the conversation
+recorded on subsequent turns. When a filter replaces the response, the event
+and the adjacent conversation therefore differ, and nothing in the log marks
+the substitution.
+
+A filter is eval logic, not a passive observer of the model response: an
+exception raised from it propagates and fails the sample (attributed to the
+filter), on both the in-process and sandboxed bridge paths, rather than
+being reported to the scaffold as a model or provider error.
 """
 
 
@@ -2906,6 +2956,76 @@ def use_model_event_sink(sink: ModelEventSink | None) -> Iterator[None]:
         yield
     finally:
         _model_event_sink.reset(token)
+
+
+BRIDGE_REQUESTED_MODEL: Final = "bridge_requested_model"
+"""`ModelEvent.metadata` key: the model name the bridged client asked for.
+
+Alias resolution can map a client-requested name onto a different Inspect model
+(e.g. codex's hardcoded `codex-auto-review` guardian slug onto the eval model),
+which otherwise erases the requested name from the transcript -- leaving
+reviewer turns indistinguishable from the agent's own.
+
+Absent on events whose request was not bridged or carried no model name:
+consumers must treat absence as "not aliased" (the event's `model` is what the
+client asked for), never as "unknown".
+"""
+
+BRIDGE_FILTER_SYNTHETIC: Final = "bridge_filter_synthetic"
+"""`ModelEvent.metadata` key: `True` when a bridge filter produced this output.
+
+No provider request was made (`call` is `None`), but the scaffold consumed the
+output, so the event exists to keep the resulting assistant message traceable.
+"""
+
+BRIDGE_REQUEST_HEADERS: Final = "bridge_request_headers"
+"""`ModelEvent.metadata` key: selected client request headers for a bridge call.
+
+Present only when a bridge opted into individual non-sensitive header names and
+the request supplied at least one of them. The mapping's lower-case keys are
+the configured names; it never contains unselected request headers.
+"""
+
+
+_model_event_metadata: ContextVar[dict[str, Any] | None] = ContextVar(
+    "_model_event_metadata", default=None
+)
+
+
+def model_event_metadata() -> dict[str, Any] | None:
+    """Extra metadata stamped onto `ModelEvent`s emitted in the current context.
+
+    Returns a copy so a caller mutating the result cannot retroactively alter
+    events already constructed from the same context.
+    """
+    metadata = _model_event_metadata.get()
+    return dict(metadata) if metadata is not None else None
+
+
+@contextlib.contextmanager
+def use_model_event_metadata(metadata: dict[str, Any] | None) -> Iterator[None]:
+    """Stamp *metadata* onto every `ModelEvent` emitted in this block.
+
+    Merges over (and overrides key collisions with) any metadata installed by
+    an enclosing block. Works identically for transcript-emitted events and
+    events routed through a `ModelEventSink` — the stamp happens at event
+    construction, before routing. Passing `None` or `{}` is a no-op.
+
+    The agent bridge uses this to preserve the client-requested model name on
+    bridged generates: alias resolution (e.g. codex's `codex-auto-review`
+    guardian slug onto the eval model) otherwise erases the requested name
+    from the transcript entirely, leaving reviewer and agent turns
+    indistinguishable.
+    """
+    if not metadata:
+        yield
+        return
+    merged = {**(_model_event_metadata.get() or {}), **metadata}
+    token = _model_event_metadata.set(merged)
+    try:
+        yield
+    finally:
+        _model_event_metadata.reset(token)
 
 
 # shared contexts for asyncio tasks

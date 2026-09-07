@@ -1,3 +1,8 @@
+from contextlib import AbstractAsyncContextManager
+from typing import Callable
+
+import anyio
+
 from inspect_ai.agent._human.commands.clock import clock_action_event
 from inspect_ai.model import ModelOutput
 from inspect_ai.util._sandbox import sandbox
@@ -14,6 +19,7 @@ async def run_human_agent_service(
     state: AgentState,
     commands: list[HumanAgentCommand],
     view: HumanAgentView | None,
+    on_ready: Callable[[], AbstractAsyncContextManager[None]] | None = None,
 ) -> AgentState:
     # initialise agent state
     instructions = "\n\n".join([message.text for message in state.messages]).strip()
@@ -36,14 +42,36 @@ async def run_human_agent_service(
             view.update_state(agent_state)
         return agent_state.answer is not None
 
-    # run the service
-    await sandbox_service(
-        name="human_agent",
-        methods=methods,
-        until=task_is_completed,
-        sandbox=sandbox(),
-        user=user,
-    )
+    if on_ready is None:
+        await sandbox_service(
+            name="human_agent",
+            methods=methods,
+            until=task_is_completed,
+            sandbox=sandbox(),
+            user=user,
+        )
+    else:
+        started = anyio.Event()
+        service_done = anyio.Event()
+
+        async def run_service() -> None:
+            try:
+                await sandbox_service(
+                    name="human_agent",
+                    methods=methods,
+                    until=task_is_completed,
+                    sandbox=sandbox(),
+                    user=user,
+                    started=started,
+                )
+            finally:
+                service_done.set()
+
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(run_service)
+            await started.wait()
+            async with on_ready():
+                await service_done.wait()
 
     # set the answer if we have one
     if agent_state.answer is not None:

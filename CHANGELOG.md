@@ -1,6 +1,36 @@
 ## Unreleased
 
+- Logging: Reduced memory usage and event-loop stalls when finalizing long samples; hooks can opt out of receiving full event histories.
 - Bugfix: `inspect score --scorer pkg/name` now resolves `@scanner` functions from installed packages (e.g. `inspect_petri/audit_judge`) instead of failing with `LookupError`; unknown names now report the "scorer couldn't be loaded" guidance rather than a raw traceback.
+- Timelines: A scorer run mid-sample (for example from a human agent's `score` command) now appears as a scoring span, not as one of the agent's sub-agents.
+- Agent Bridge: A provider error delivered during a streamed response now reaches the bridged agent as an error instead of a malformed HTTP 200 success.
+- Anthropic: Forced web searches (`tool_choice` naming `web_search`) now work on Claude 4.6+ models, including bridged agents' web search.
+- Agent Bridge: A bridged Anthropic client now sees conflict, timeout, and billing errors as such instead of as generic server errors.
+- Bridged agent transcripts now identify which model a request was for, and record output a generate filter produced.
+- Sandbox agent bridges can attach selected non-sensitive client request headers to their model events for external session attribution.
+- OpenAI: Native Responses agent messages now retain their optional identifiers during replay.
+- Agent Bridge: Native Anthropic Messages streams preserve provider message IDs and served models; bridged Codex Responses events retain root and collab-spawn thread lineage.
+- Anthropic: Structured output requests whose response schema has an optional (nullable) field no longer fail with HTTP 400; `additionalProperties: false` is now applied to object nodes only.
+- Eval: added opt-in `INSPECT_GC_MODE=low_latency` to suppress automatic full collections during high-concurrency runs while retaining a cgroup-memory guard.
+- MCP: a sandboxed MCP server is now started once per sample instead of once per tool call, so an eval with many concurrent samples no longer spends most of its time on server startup and handshakes.
+- Task: added `sample_resources`, async context managers held open for a whole sample (entered once its sandbox exists, exited after scoring) — use it to pay for a per-sample connection or process once rather than per solver.
+- Human Agent: `human_cli()` now accepts a `commands_filter` option for tailoring the commands available in the human agent CLI.
+- Agent Bridge: `agent_bridge()` and `sandbox_agent_bridge()` now accept a `response_filter` for transforming model output before it is returned.
+- Agent Bridge: Client-supplied HTTP headers are now forwarded through the sandbox agent-bridge model proxy to the bridged model request.
+- Agent Bridge: A bridged client's `reasoning` options now reach the model request verbatim when forwarding generation config, preserving fields like `context` that were previously dropped.
+- Agent Bridge: Transparent bridged requests now decode Brotli responses when clients advertise `br` through `Accept-Encoding`.
+- Human Agent: `human_cli()` integrations can initialize operator tooling once task commands are ready, with cleanup tied to session completion.
+- Deep Agent: Background subagents now remain available while eval scorers run after the solver completes.
+- Agent Bridge: `state_filter` lets integrations select which bridged requests update canonical agent state.
+- Agent Bridge: `sandbox_agent_bridge()` can now preserve every conversation a sandbox runs, instead of returning only one when the sandbox ran several.
+- Agent Bridge: each preserved conversation now appears as its own transcript span, so multi-conversation sessions read as separate threads instead of one flat list.
+- Agent Bridge: Sandboxed agents now receive exhausted provider errors with their original status and error details.
+- Tools: A tool argument a model fills with a value its schema allowed but the underlying type rejects is now returned as a retryable error instead of ending the sample.
+- Agent Bridge: Side calls to a different model can no longer displace the tracked agent conversation, regardless of thread shape.
+- Anthropic: A client-supplied `fallbacks` directive is now forwarded to the API verbatim instead of being dropped (skipped on bedrock/vertex/azure, which reject the field).
+- Agent Bridge: long sandbox sessions no longer slow to a halt, and sub-agent spans keep their conversation, once the transcript starts serving events from the sample buffer.
+- Transcript: `Transcript.subscribe()` registers a callback for events as they are recorded, including a model event's raw API call before it is condensed.
+- Bugfix: `sandbox.exec_remote()` (and so bridged agents) no longer fails when the sandbox stops answering for up to 15 minutes while the command runs; a new `start_timeout` option bounds the launch separately.
 
 ## 0.3.265 (17 September 2026)
 

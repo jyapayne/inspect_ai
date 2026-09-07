@@ -7,7 +7,17 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from logging import getLogger
 from pathlib import PurePath
-from typing import Any, Awaitable, Callable, Literal, NamedTuple, Protocol, TypeAlias
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Literal,
+    NamedTuple,
+    Protocol,
+    Sequence,
+    TypeAlias,
+)
 
 import anyio
 from anyio.abc import TaskGroup
@@ -193,7 +203,7 @@ from inspect_ai.util._span import span
 from inspect_ai.util._store import init_subtask_store
 
 from ..context import init_task_context
-from ..task import Task
+from ..task import SampleResource, Task
 from .enqueue import get_task_enqueuer
 from .error import SampleErrorHandler, _should_eval_fail
 from .generate import task_generate
@@ -1526,6 +1536,7 @@ async def task_run(options: TaskRunOptions, task_cancel: TaskCancel | None) -> E
                         scorer_names=scorer_names,
                         scanner=scanner,
                         cleanup=task.cleanup,
+                        sample_resources=task.sample_resources,
                         generate=generate,
                         logger=logger if log_samples else None,
                         log_images=log_images,
@@ -2146,6 +2157,39 @@ def _sample_started() -> float | None:
     return started.timestamp() if started is not None else None
 
 
+@contextlib.asynccontextmanager
+async def _sample_resources_cm(
+    resources: "Sequence[SampleResource]", state: TaskState
+) -> AsyncIterator[None]:
+    """Hold a sample's `Task.sample_resources` open for its whole run.
+
+    Entered and exited in the sample's own task, so a resource may span setup,
+    solver and scoring without the task-affine teardown problem an
+    `AsyncExitStack` carried across tasks would have.
+
+    The cancel scope encloses the resources rather than being entered in the
+    `finally`: anyio requires scopes to exit in reverse entry order, so a scope
+    opened after the resources' own scopes (e.g. the task group inside an MCP
+    connection) makes teardown die with "Attempted to exit a cancel scope that
+    isn't the current tasks's current cancel scope". Flipping `shield` on the
+    already-innermost-compatible scope protects teardown from cancellation
+    arriving after the body without changing scope order; resources that must
+    survive an already-delivered cancellation shield their own teardown (as the
+    MCP server kill path does).
+    """
+    if not resources:
+        yield
+        return
+    with anyio.CancelScope() as scope:
+        async with contextlib.AsyncExitStack() as exit_stack:
+            for resource in resources:
+                await exit_stack.enter_async_context(resource(state))
+            try:
+                yield
+            finally:
+                scope.shield = True
+
+
 async def task_run_sample(
     *,
     task: Task,
@@ -2164,6 +2208,7 @@ async def task_run_sample(
     scorer_names: list[str] | None,
     scanner: "Scanners | None",
     cleanup: Callable[[TaskState], Awaitable[None]] | None,
+    sample_resources: "Sequence[SampleResource]",
     generate: Generate,
     logger: TaskLogger | None,
     log_images: bool,
@@ -2217,6 +2262,7 @@ async def task_run_sample(
             scorer_names=scorer_names,
             scanner=scanner,
             cleanup=cleanup,
+            sample_resources=sample_resources,
             generate=generate,
             logger=logger,
             log_images=log_images,
@@ -2268,6 +2314,7 @@ async def _task_run_sample_attempt(
     scorer_names: list[str] | None,
     scanner: "Scanners | None",
     cleanup: Callable[[TaskState], Awaitable[None]] | None,
+    sample_resources: "Sequence[SampleResource]",
     generate: Generate,
     logger: TaskLogger | None,
     log_images: bool,
@@ -2600,7 +2647,7 @@ async def _task_run_sample_attempt(
                         sample_summary,
                     )
 
-                async with sandboxenv_cm:
+                async with sandboxenv_cm, _sample_resources_cm(sample_resources, state):
                     try:
                         # update active sample wth sandboxes now that we are initialised
                         # (ensure that we still exit init context in presence of sandbox error)
@@ -3126,6 +3173,15 @@ async def _task_run_sample_attempt(
                                 logger.buffer_db is None
                                 or not sample_transcript.history.resident_events_truncated
                             )
+                            materialize_full_sample = (
+                                log_from_memory
+                                or _finalization_consumes_events(
+                                    scanning=scanner is not None
+                                    and scan_id is not None,
+                                    sample_feed=sample_feed,
+                                    task_source=task_source,
+                                )
+                            )
                             eval_sample = await log_sample(
                                 eval_sample=make_eval_sample(
                                     include_events=log_from_memory
@@ -3133,6 +3189,7 @@ async def _task_run_sample_attempt(
                                 logger=logger,
                                 log_images=log_images,
                                 from_memory=log_from_memory,
+                                materialize_full_sample=materialize_full_sample,
                             )
                             results = scores_as_logged(results, eval_sample)
                         else:
@@ -3363,20 +3420,41 @@ def create_eval_sample(
     )
 
 
+def _finalization_consumes_events(
+    *,
+    scanning: bool,
+    sample_feed: SampleSource | None,
+    task_source: TaskSource | None,
+) -> bool:
+    """Whether a finalization consumer needs the sample's event history."""
+    from inspect_ai.hooks._hooks import any_hook_needs_full_sample
+
+    # Hook enablement must stay stable until on_sample_end dispatch.
+    return (
+        scanning
+        or sample_feed is not None
+        or task_source is not None
+        or any_hook_needs_full_sample()
+    )
+
+
 async def log_sample(
     eval_sample: EvalSample,
     logger: TaskLogger,
     log_images: bool,
     *,
     from_memory: bool,
+    materialize_full_sample: bool,
 ) -> EvalSample:
+    """Log a sample, returning the data needed by finalization consumers.
+
+    With ``from_memory=True``, ``eval_sample`` must contain the full history.
+    On buffer readback, ``materialize_full_sample=False`` returns a sample
+    without events, attachments or timelines; the written log remains complete.
+    """
     try:
-        # No realtime buffer DB, or the full history is still resident in memory:
-        # log directly from the in-memory sample (which carries its events). This
-        # avoids the open_sample_history -> materialize_streaming_sample round-trip
-        # (read every event back out of SQLite + re-validate). `complete_sample`
-        # still finalizes the buffer DB via `_finalize_sample`, so when a realtime
-        # buffer exists it stays consistent for live viewing.
+        # Avoid reading resident events back from the buffer. complete_sample
+        # still finalizes the buffer for live viewing.
         if logger.buffer_db is None or from_memory:
             await logger.complete_sample(
                 condense_sample(eval_sample, log_images), flush=True
@@ -3393,8 +3471,15 @@ async def log_sample(
         with logger.buffer_db.open_sample_history(
             eval_sample.id, eval_sample.epoch
         ) as sample_history:
-            materialized_sample = materialize_streaming_sample(
-                eval_sample, sample_history
+            # Restored attachments may exist only in eval_sample, so retain
+            # them in logging_sample. Clear timelines only in the reduced
+            # return value: their event references also retain history.
+            materialized_sample = (
+                materialize_streaming_sample(eval_sample, sample_history)
+                if materialize_full_sample
+                else eval_sample.model_copy(
+                    update={"attachments": {}, "timelines": None}
+                )
             )
             await logger.complete_sample_streaming(
                 logging_sample, sample_history, flush=True

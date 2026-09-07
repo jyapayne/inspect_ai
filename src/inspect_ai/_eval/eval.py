@@ -55,7 +55,12 @@ from inspect_ai._util.constants import (
     JSON_LOG_FORMAT,
 )
 from inspect_ai._util.error import PrerequisiteError
+from inspect_ai._util.event_loop_monitor import (
+    event_loop_monitor,
+    loop_attribution_enabled,
+)
 from inspect_ai._util.file import absolute_file_path, filesystem
+from inspect_ai._util.gc_tuning import configure_gc
 from inspect_ai._util.log_context import set_run_shape
 from inspect_ai._util.logger import warn_once
 from inspect_ai._util.platform import platform_init
@@ -1042,6 +1047,7 @@ async def _eval_async_inner(
         )
         enqueuer: TaskEnqueuer = create_task_enqueuer(run_id, resolve_added_tasks)
         enqueuer_token = register_task_enqueuer(enqueuer)
+        configure_gc()
 
         async with (
             control_server(run_id=run_id, enabled=ctl.enabled) as _ctl_server,
@@ -1088,32 +1094,37 @@ async def _eval_async_inner(
                         for name in resolved_task_names(tasks)
                         if name not in task_names
                     )
-                    return await eval_run(
-                        eval_set_id=eval_set_id,
-                        eval_set_tasks=task_names,
-                        run_id=run_id,
-                        tasks=tasks,
-                        parallel=parallel,
-                        eval_config=eval_config,
-                        eval_checkpoint=checkpoint,
-                        recorder=recorder,
-                        header_only=log_header_only,
-                        epochs_reducer=epochs_reducer,
-                        approval=approval,
-                        review=review,
-                        solver=solver,
-                        scanner=scanner,
-                        scan_id=scan_id,
-                        tags=tags,
-                        metadata=metadata,
-                        run_samples=run_samples,
-                        score=score,
-                        debug_errors=debug,
-                        task_retry_attempts=task_retry_attempts,
-                        task_source=task_source,
-                        inject=inject,
-                        **kwargs,
-                    )
+                    async with (
+                        event_loop_monitor(interval=0.05, threshold=0.5)
+                        if loop_attribution_enabled()
+                        else contextlib.nullcontext()
+                    ):
+                        return await eval_run(
+                            eval_set_id=eval_set_id,
+                            eval_set_tasks=task_names,
+                            run_id=run_id,
+                            tasks=tasks,
+                            parallel=parallel,
+                            eval_config=eval_config,
+                            eval_checkpoint=checkpoint,
+                            recorder=recorder,
+                            header_only=log_header_only,
+                            epochs_reducer=epochs_reducer,
+                            approval=approval,
+                            review=review,
+                            solver=solver,
+                            scanner=scanner,
+                            scan_id=scan_id,
+                            tags=tags,
+                            metadata=metadata,
+                            run_samples=run_samples,
+                            score=score,
+                            debug_errors=debug,
+                            task_retry_attempts=task_retry_attempts,
+                            task_source=task_source,
+                            inject=inject,
+                            **kwargs,
+                        )
 
                 # Run successive batches under this run_id until the run is
                 # exhausted: the seed first, then tasks added imperatively

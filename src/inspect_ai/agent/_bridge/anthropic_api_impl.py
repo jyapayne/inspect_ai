@@ -109,6 +109,7 @@ async def inspect_anthropic_api_request_impl(
     bridge: AgentBridge,
     *,
     beta: bool = False,
+    metadata_headers: dict[str, str] | None = None,
 ) -> Message | BetaMessage:
     # resolve model
     bridge_model_name = str(json_data["model"])
@@ -183,7 +184,14 @@ async def inspect_anthropic_api_request_impl(
 
     # if there is a bridge filter give it a shot first
     output, c_message = await bridge_generate(
-        bridge, model, messages, tools, tool_choice, config
+        bridge,
+        model,
+        messages,
+        tools,
+        tool_choice,
+        config,
+        requested_model=bridge_model_name,
+        metadata_headers=metadata_headers,
     )
     if c_message is not None:
         messages.append(c_message)
@@ -191,7 +199,7 @@ async def inspect_anthropic_api_request_impl(
     debug_log("INSPECT OUTPUT", output.message)
 
     # update state if we have more messages than the last generation
-    await bridge._track_state(messages, output)
+    await bridge._track_state(messages, output, str(ModelName(model)))
 
     # return message (use beta message type if request came from beta endpoint)
     message_class = BetaMessage if beta else Message
@@ -323,6 +331,19 @@ def generate_config_from_anthropic(json_data: dict[str, Any]) -> GenerateConfig:
     for field in anthropic_extra_body_fields():
         if field in json_data:
             extra_body[field] = json_data[field]
+
+    # Forward a client-supplied server-side fallback directive VERBATIM. Claude
+    # Code sends `fallbacks` (plus the matching `server-side-fallback` beta) so
+    # the API can serve a refused request with another model. Dropping it turns
+    # a refusal that production would transparently hand off into a dead turn:
+    # the client sees stop_reason=refusal with an empty completion, retries the
+    # same model, and the sample lands scored-but-empty. We do not reinterpret it
+    # into `fallback_models` -- that would re-serialize to `[{"model": ...}]` and
+    # drop any other field the client sent, and it is subject to Inspect's own
+    # warn-and-ignore gating. The response side records the handoff regardless
+    # (see `serving_model` / `ModelFallback` in the anthropic provider).
+    if (fallbacks := json_data.get("fallbacks")) is not None:
+        extra_body["fallbacks"] = fallbacks
     if len(extra_body) > 0:
         config.extra_body = extra_body
 

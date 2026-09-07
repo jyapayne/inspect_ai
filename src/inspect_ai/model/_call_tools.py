@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 import anyio
 import yaml
 from anyio.streams.memory import MemoryObjectSendStream
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from typing_extensions import is_typeddict
 
 from inspect_ai._util.content import (
@@ -771,7 +771,10 @@ async def call_tool(
         raise await record_tool_parsing_error(validation_errors)
 
     # get arguments (with creation of dataclasses, pydantic objects, etc.)
-    arguments = tool_params(call.arguments, tool_def.tool)
+    try:
+        arguments = tool_params(call.arguments, tool_def.tool)
+    except ToolParsingError as ex:
+        raise await record_tool_parsing_error(ex.message)
 
     # call the tool
     with trace_action(
@@ -1162,7 +1165,27 @@ def tool_params(input: dict[str, Any], func: Callable[..., Any]) -> dict[str, An
 
         # yield parameter (fail if not passed and there is no default)
         if param_name in input:
-            params[param_name] = tool_param(type_hint, input.get(param_name))
+            # a field can be looser in the tool's published schema than in the type behind
+            # it (a Literal with a default publishes as a plain string, a date only as a
+            # format), so the type's own validation is the first thing to reject the value.
+            # Raised here it would end the sample; returned, the model can correct it.
+            try:
+                params[param_name] = tool_param(type_hint, input.get(param_name))
+            except ValidationError as ex:
+                detail = "; ".join(
+                    f"{field}: {error['msg']}" if field else error["msg"]
+                    for error, field in (
+                        (error, ".".join(str(loc) for loc in error["loc"]))
+                        for error in ex.errors(include_url=False)
+                    )
+                )
+                raise ToolParsingError(
+                    f"Unable to convert the value provided for parameter {param_name}: {detail}"
+                )
+            except ValueError as ex:
+                raise ToolParsingError(
+                    f"Unable to convert the value provided for parameter {param_name}: {ex}"
+                )
         elif param.default is not inspect.Parameter.empty:
             params[param_name] = param.default
         elif type_hint_includes_none(type_hint):

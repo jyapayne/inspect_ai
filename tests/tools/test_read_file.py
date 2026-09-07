@@ -1,5 +1,7 @@
 """Tests for read_file tool."""
 
+from pathlib import Path
+
 import pytest
 from test_helpers.tool_call_utils import get_tool_call, get_tool_response
 from test_helpers.utils import skip_if_no_docker
@@ -9,7 +11,19 @@ from inspect_ai.dataset import Sample
 from inspect_ai.model import ModelOutput, get_model
 from inspect_ai.scorer import includes
 from inspect_ai.solver import generate, use_tools
-from inspect_ai.tool import read_file
+from inspect_ai.tool import Tool, read_file
+from inspect_ai.util import SandboxEnvironmentType
+
+TOOL_SANDBOX: SandboxEnvironmentType = (
+    "docker",
+    str(Path(__file__).with_name("test_sandbox_compose.yaml")),
+)
+
+CWD_TEST_FILES = {
+    "provider-default.txt": "provider-default-read-file",
+    "/tmp/cwd-bound/inside.txt": "configured-cwd-read-file",
+    "/tmp/outside/outside.txt": "absolute-path-read-file",
+}
 
 
 def test_read_file_constructible() -> None:
@@ -18,7 +32,12 @@ def test_read_file_constructible() -> None:
     assert tool is not None
 
 
-def _read_file_task(files: dict | None = None) -> Task:
+def _read_file_task(
+    files: dict[str, str] | None = None,
+    *,
+    tool: Tool | None = None,
+    sandbox: SandboxEnvironmentType = "docker",
+) -> Task:
     sample = Sample(
         input="Please use the tool",
         target="n/a",
@@ -26,15 +45,21 @@ def _read_file_task(files: dict | None = None) -> Task:
     )
     return Task(
         dataset=[sample],
-        solver=[use_tools(read_file()), generate()],
+        solver=[use_tools(tool if tool is not None else read_file()), generate()],
         scorer=includes(),
         message_limit=3,
-        sandbox="docker",
+        sandbox=sandbox,
     )
 
 
-def _run_read_file(tool_arguments: dict, files: dict | None = None) -> str:
-    task = _read_file_task(files)
+def _run_read_file(
+    tool_arguments: dict,
+    files: dict[str, str] | None = None,
+    *,
+    tool: Tool | None = None,
+    sandbox: SandboxEnvironmentType = "docker",
+) -> str:
+    task = _read_file_task(files, tool=tool, sandbox=sandbox)
     result = eval(
         task,
         model=get_model(
@@ -119,3 +144,37 @@ def test_read_file_not_found() -> None:
     assert response is not None
     assert response.error is not None
     assert "not found" in response.error.message.lower()
+
+
+@skip_if_no_docker
+@pytest.mark.slow
+def test_read_file_cwd_uses_configured_directory_and_keeps_absolute_paths() -> None:
+    configured_tool = read_file(cwd="/tmp/cwd-bound")
+
+    relative_content = _run_read_file(
+        {"file_path": "inside.txt"},
+        CWD_TEST_FILES,
+        tool=configured_tool,
+        sandbox=TOOL_SANDBOX,
+    )
+    absolute_content = _run_read_file(
+        {"file_path": "/tmp/outside/outside.txt"},
+        CWD_TEST_FILES,
+        tool=configured_tool,
+        sandbox=TOOL_SANDBOX,
+    )
+
+    assert "configured-cwd-read-file" in relative_content
+    assert "absolute-path-read-file" in absolute_content
+
+
+@skip_if_no_docker
+@pytest.mark.slow
+def test_read_file_omitted_cwd_keeps_provider_default_directory() -> None:
+    content = _run_read_file(
+        {"file_path": "provider-default.txt"},
+        CWD_TEST_FILES,
+        sandbox=TOOL_SANDBOX,
+    )
+
+    assert "provider-default-read-file" in content

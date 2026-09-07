@@ -17,11 +17,18 @@ async def inspect_responses_api_request(
     web_search: WebSearchProviders | None,
     code_execution: CodeExecutionProviders | None,
     bridge: AgentBridge,
+    *,
+    metadata_headers: dict[str, str] | None = None,
 ) -> "Response":
     validate_openai_client("agent bridge")
 
     from .responses_impl import inspect_responses_api_request_impl
 
     return await inspect_responses_api_request_impl(
-        json_data, headers, web_search, code_execution, bridge
+        json_data,
+        headers,
+        web_search,
+        code_execution,
+        bridge,
+        metadata_headers=metadata_headers,
     )

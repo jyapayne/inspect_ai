@@ -1209,6 +1209,7 @@ async def test_google_dialect_hides_the_rejected_call() -> None:
     bridge = rejecting_bridge(rejected_then_safe())
     response = await inspect_google_api_request(
         {"contents": [{"role": "user", "parts": [{"text": TASK}]}]},
+        None,
         internal_web_search_providers(),
         default_code_execution_providers(),
         bridge,

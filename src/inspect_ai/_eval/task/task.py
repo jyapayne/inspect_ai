@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from logging import getLogger
 from typing import (
@@ -70,6 +71,14 @@ from .sample_source import SampleSource
 
 logger = getLogger(__name__)
 
+SampleResource = Callable[[TaskState], AbstractAsyncContextManager[None]]
+"""Factory for a resource held open for the duration of one sample.
+
+Called with the sample's initial `TaskState` once its sandbox is available; the
+returned context manager is entered before the plan runs and exited after
+scoring, in the sample's own task. See `Task`'s `sample_resources` argument.
+"""
+
 
 class TaskDeprecatedArgs(TypedDict, total=False):
     plan: Plan | Solver | list[Solver]
@@ -121,6 +130,7 @@ class Task:
         tags: list[str] | None = None,
         viewer: ViewerConfig | None = None,
         headline_metric: HeadlineMetric | str | None = None,
+        sample_resources: "Sequence[SampleResource] | None" = None,
         **kwargs: Unpack[TaskDeprecatedArgs],
     ) -> None:
         """Create a task.
@@ -203,6 +213,14 @@ class Task:
                 convention, so `HeadlineMetric(metric="accuracy")` takes that
                 metric from the first score reporting it; the default is the
                 first metric of the first score.
+            sample_resources: Async context managers held open for the whole of
+                each sample. Entered once the sample's sandbox is available and
+                exited after scoring and `cleanup`, in the sample's own task, so
+                a resource can span setup, solver and scoring. Use for a
+                connection or process a sample should pay for once (e.g. holding
+                one MCP server for the sample rather than per solver or per tool
+                call). Not part of the task's plan, so adding one does not change
+                task identity or eval-set resume.
             **kwargs: Deprecated arguments.
         """
         # handle deprecated args
@@ -266,6 +284,7 @@ class Task:
         self.tags = tags
         self.viewer = viewer
         self.headline_metric = resolve_headline_metric_spec(headline_metric)
+        self.sample_resources = list(sample_resources) if sample_resources else []
 
     @property
     def name(self) -> str:

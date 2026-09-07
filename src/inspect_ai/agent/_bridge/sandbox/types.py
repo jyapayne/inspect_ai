@@ -8,13 +8,14 @@ from pydantic_core import to_jsonable_python
 from inspect_ai._util.exception import TerminateSampleError
 from inspect_ai._util.logger import warn_once
 from inspect_ai.agent._agent import AgentState
-from inspect_ai.agent._bridge.types import AgentBridge
+from inspect_ai.agent._bridge.types import AgentBridge, StateFilter
 from inspect_ai.model._compaction.types import CompactionStrategy
 from inspect_ai.model._model import (
     GenerateFilter,
     Model,
     ModelEventSink,
     ModelResolver,
+    ModelResponseFilter,
 )
 from inspect_ai.tool import Tool
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
@@ -54,6 +55,10 @@ class SandboxAgentBridge(AgentBridge):
         allow_remote_mcp: bool = False,
         allow_remote_media: bool = False,
         model_resolver: ModelResolver | None = None,
+        model_event_metadata_headers: Sequence[str] | None = None,
+        response_filter: ModelResponseFilter | None = None,
+        state_filter: StateFilter | None = None,
+        accumulate_conversations: bool = False,
     ) -> None:
         super().__init__(
             state,
@@ -69,6 +74,10 @@ class SandboxAgentBridge(AgentBridge):
             allow_remote_mcp=allow_remote_mcp,
             allow_remote_media=allow_remote_media,
             model_resolver=model_resolver,
+            model_event_metadata_headers=model_event_metadata_headers,
+            response_filter=response_filter,
+            state_filter=state_filter,
+            accumulate_conversations=accumulate_conversations,
         )
         self.port = port
         self.mcp_server_configs = mcp_server_configs or []

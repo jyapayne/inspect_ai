@@ -1,15 +1,23 @@
+from collections.abc import Callable
+from contextvars import ContextVar
+from dataclasses import dataclass
 from enum import IntEnum
 from functools import lru_cache
 from typing import TYPE_CHECKING, NamedTuple, NoReturn, Sequence, Set
 
 from shortuuid import uuid
 
+from inspect_ai._util.content import ContentReasoning, ContentText
 from inspect_ai._util.exception import TerminateSampleError
 from inspect_ai._util.hash import mm3_hash
 from inspect_ai._util.json import to_json_str_safe
 from inspect_ai.agent._agent import AgentState
 from inspect_ai.log._condense import ATTACHMENT_PROTOCOL
-from inspect_ai.model._chat_message import ChatMessage, ChatMessageUser
+from inspect_ai.model._chat_message import (
+    ChatMessage,
+    ChatMessageAssistant,
+    ChatMessageUser,
+)
 from inspect_ai.model._compaction import (
     Compact,
     CompactionStrategy,
@@ -22,6 +30,7 @@ from inspect_ai.model._model import (
     Model,
     ModelEventSink,
     ModelResolver,
+    ModelResponseFilter,
 )
 from inspect_ai.model._model_output import ModelOutput
 from inspect_ai.tool._tool import Tool
@@ -36,6 +45,59 @@ if TYPE_CHECKING:
     # cycles back through partially-initialized modules). Same reason
     # `model/_call_tools.py` defers it.
     from inspect_ai.approval._policy import ApprovalPolicy
+    from inspect_ai.event import Event, ModelEvent, SpanBeginEvent
+
+
+_SENSITIVE_MODEL_EVENT_METADATA_HEADER_PARTS = (
+    "authorization",
+    "cookie",
+    "credential",
+    "key",
+    "secret",
+    "token",
+    "password",
+)
+
+_HTTP_HEADER_TOKEN_CHARACTERS = frozenset("!#$%&'*+-.^_`|~")
+
+
+def _is_valid_http_header_name(name: str) -> bool:
+    """Return whether ``name`` has the RFC 9110 HTTP field-name token syntax."""
+    return name.isascii() and all(
+        character.isalnum() or character in _HTTP_HEADER_TOKEN_CHARACTERS
+        for character in name
+    )
+
+
+def _normalize_model_event_metadata_headers(
+    headers: Sequence[str] | None,
+) -> frozenset[str]:
+    """Validate and normalize headers that may enter `ModelEvent` metadata."""
+    if headers is None:
+        return frozenset()
+    if isinstance(headers, str):
+        raise ValueError("model event metadata headers must be a sequence of names")
+
+    normalized: set[str] = set()
+    for header in headers:
+        if not isinstance(header, str):
+            raise ValueError("model event metadata headers must be strings")
+        name = header.strip().lower()
+        if not name:
+            raise ValueError("model event metadata headers cannot be empty")
+        if not _is_valid_http_header_name(name):
+            raise ValueError(
+                "model event metadata headers must be valid HTTP token names"
+            )
+        if any(part in name for part in _SENSITIVE_MODEL_EVENT_METADATA_HEADER_PARTS):
+            raise ValueError(
+                "model event metadata headers cannot include sensitive headers"
+            )
+        normalized.add(name)
+    return frozenset(normalized)
+
+
+StateFilter = Callable[[Sequence[ChatMessage]], bool]
 
 
 class AgentBridge:
@@ -52,10 +114,14 @@ class AgentBridge:
         model_event_sink: ModelEventSink | None = None,
         forward_generation_config: bool = False,
         approval: list["ApprovalPolicy"] | None = None,
+        accumulate_conversations: bool = False,
         checkpointer: Checkpointer | None = None,
         allow_remote_mcp: bool = True,
         allow_remote_media: bool = False,
         model_resolver: ModelResolver | None = None,
+        model_event_metadata_headers: Sequence[str] | None = None,
+        response_filter: ModelResponseFilter | None = None,
+        state_filter: StateFilter | None = None,
     ) -> None:
         # Capabilities a client-declared request may reach for. Media defaults
         # closed so new bridge subclasses cannot accidentally grant host I/O.
@@ -101,16 +167,22 @@ class AgentBridge:
             value_type=list[ChatMessage],
         )
         self.filter = filter
+        self.response_filter = response_filter
         self.retry_refusals = retry_refusals
         self.model = model
         self.model_aliases: dict[str, str | Model] = model_aliases or {}
         self.model_resolver = model_resolver
         self.model_event_sink = model_event_sink
+        self.model_event_metadata_headers = _normalize_model_event_metadata_headers(
+            model_event_metadata_headers
+        )
         self.forward_generation_config = forward_generation_config
         self.approval = approval
+        self.state_filter = state_filter
         self._compaction = compaction
         self._compact: Compact | None = None
-        self._last_message_count = 0
+        self._last_message_counts: dict[str | None, int] = {}
+        self._primary_model: str | None = None
         # thread-tracking state for _track_state (see its docstring). the
         # descent anchor is the initial input (via _compaction_prefix, which
         # restores to the original input on checkpoint resume).
@@ -124,8 +196,60 @@ class AgentBridge:
         self._tracked_calls = 0
         self._tracked_descends: _Descent | None = None
         self._candidate_fps: list[_MessageFingerprint] | None = None
+        self._candidate_messages: list[ChatMessage] | None = None
         self._pending_operator = 0
+        # accumulation state for _accumulate_conversation (see its docstring). Adopted on
+        # ANY resume, unlike bridge_messages above: the scaffold replays only the
+        # conversation it was in, so dropping the rest would lose every earlier one for
+        # good -- and they are the whole point of accumulating. Replays do not duplicate,
+        # because a call equal to or contained in a stored conversation is absorbed rather
+        # than appended.
+        self._accumulate_conversations = accumulate_conversations
+        self._conversations: list[_Conversation] = self._cp.track(
+            "bridge_conversations",
+            lambda: self._conversations,
+            [],
+            value_type=list[_Conversation],
+        )
         self._operator_keys: set[str] = set()
+        # Span emission for accumulated conversations. The emitter owns the
+        # `span_id`/`ordinal`/`first_seen_call`/`resume_adopted` fields on
+        # `_Conversation`; the accumulator owns `key`/`messages`/`output`. It
+        # runs whenever conversations accumulate. A caller-supplied sink does
+        # not disable it -- the two compose: the sink keeps deciding when and
+        # under which span an event is written (sub-agent identity a native
+        # harness recovers from its own records), and the emitter attributes
+        # the events the sink wrote to their conversation's span. Disabling
+        # emission when a sink was present left every native-harness run
+        # (all four wrappers install one) span-less, carried by flattening
+        # alone.
+        self._span_emitter: _ConversationSpanEmitter | None = None
+        if accumulate_conversations:
+            self._span_emitter = _ConversationSpanEmitter(
+                self, writes_events=model_event_sink is None
+            )
+            self.model_event_sink = (
+                self._span_emitter
+                if model_event_sink is None
+                else _ComposedModelEventSink(self._span_emitter, model_event_sink)
+            )
+        # Conversations restored from a checkpoint predate this process: the spans
+        # that carried their events closed with the process that opened them, so the
+        # next call continuing one mints a fresh span, marked by `resume_adopted`.
+        # A legacy snapshot (written before span emission existed) restores every
+        # conversation with default span metadata; first-seen order survives as the
+        # list order, so ordinals are re-derived from it. `first_seen_call` is
+        # process-local and unknowable across the boundary: zeroed, with
+        # `resume_adopted` marking the discontinuity.
+        legacy_ordinals = len(self._conversations) > 1 and all(
+            conversation.ordinal == 0 for conversation in self._conversations
+        )
+        for index, conversation in enumerate(self._conversations):
+            conversation.span_id = None
+            conversation.resume_adopted = True
+            conversation.first_seen_call = 0
+            if legacy_ordinals:
+                conversation.ordinal = index
 
     state: AgentState
     """State updated from messages traveling over the bridge."""
@@ -134,6 +258,28 @@ class AgentBridge:
     """Filter for bridge model generation.
 
     A filter may substitute for the default model generation by returning a ModelOutput or return None to allow default processing to continue.
+    """
+
+    response_filter: ModelResponseFilter | None
+    """Filter that mutates the model's output after generation.
+
+    Runs inside the refusal-retry loop, after ``model.generate()`` returns
+    and after the compaction baseline is updated from that call's actual
+    usage. Returning ``None`` passes the output through unchanged; returning
+    a ``ModelOutput`` replaces it. Returning an output with
+    ``stop_reason="content_filter"`` triggers a retry (subject to
+    ``retry_refusals``).
+
+    See ``ModelResponseFilter`` for guidance on cross-turn consistency when
+    mutating tool_use arguments.
+    """
+
+    state_filter: StateFilter | None
+    """Optional predicate that selects requests whose generations update state.
+
+    Requests rejected by the predicate still generate responses, emit model
+    events, and tick the checkpointer, but leave tracked conversation state
+    unchanged. Exceptions from the predicate propagate to the request handler.
     """
 
     model: str | None
@@ -164,6 +310,15 @@ class AgentBridge:
     spans (e.g. spans driven by a side-channel event stream).
     """
 
+    model_event_metadata_headers: frozenset[str]
+    """Lower-case inbound header names copied into bridged `ModelEvent` metadata.
+
+    Empty by default. When configured, a bridge copies only these names from
+    the request's `GenerateConfig.extra_headers` into the
+    `BRIDGE_REQUEST_HEADERS` metadata mapping. Sensitive header names are
+    rejected at construction.
+    """
+
     forward_generation_config: bool
     """Whether to forward client generation parameters to the model.
 
@@ -188,6 +343,11 @@ class AgentBridge:
     agent body is invisible to them. Setting policies here is the only reliable way
     to scope approval from within the agent.
     """
+
+    def close_conversation_spans(self) -> None:
+        """End every accumulated conversation's span (no-op without accumulation)."""
+        if self._span_emitter is not None:
+            self._span_emitter.close()
 
     def request_terminate(self, reason: str) -> NoReturn:
         """Terminate the sample from a bridged generation.
@@ -275,12 +435,21 @@ class AgentBridge:
 
     _message_ids: dict[str, list[str]]
 
-    async def _track_state(self, input: list[ChatMessage], output: ModelOutput) -> None:
+    async def _track_state(
+        self,
+        input: list[ChatMessage],
+        output: ModelOutput,
+        model: str | None = None,
+    ) -> None:
         """Track agent state by observing generations made through the bridge.
 
         We need to distinguish the "main" thread of generation from side /
         sub-agent model calls (e.g. claude code does bash path detection with a
         side call; opencode names the session with a title-generation call).
+        An optional state filter determines which requests contribute to the
+        canonical agent state. Rejected requests still complete normally but
+        leave the tracked conversation unchanged.
+
         Message counts alone can't do this: a side call that is longer than the
         main conversation (opencode's title call fires before the main loop's
         first call and carries an extra preamble message) would permanently
@@ -313,18 +482,35 @@ class AgentBridge:
           has more messages than the previous generation (or, when both
           threads descend, than the tracked thread — so a parked side call
           can't lower the bar for a stray descending one-shot).
-        - A new thread that isn't adopted is remembered as a candidate; if the
-          next call extends it, it's a live agent loop and is promoted. This is
-          what recovers tracking after history compaction (scaffold-side
-          compaction replaces the conversation with a summary, so the
-          post-compaction loop neither extends the tracked thread nor descends
-          from the initial input). Promotion is unconditional, so a multi-call
-          sub-agent loop transiently takes over tracking this way — the main
-          loop reclaims it on resumption, by extension when it makes several
-          further calls (candidate promotion) or by the longer-descending-call
-          displacement above when it makes only one.
+        - A new thread that isn't adopted is remembered as a candidate. If the
+          next call extends the candidate, it is a live agent loop and is
+          promoted. This recovers tracking after history compaction
+          (scaffold-side compaction replaces the conversation with a summary,
+          so the post-compaction loop neither extends the tracked thread nor
+          descends from the initial input). Promotion is unconditional, so a
+          multi-call sub-agent loop transiently takes over.
+
+        When `accumulate_conversations` is set, none of the above applies: every
+        conversation observed over the bridge is kept and concatenated instead of
+        one being chosen. See `_accumulate_conversation`.
         """
+        if self.state_filter is not None and not self.state_filter(input):
+            await self._cp.tick()
+            return
+
+        if self._accumulate_conversations:
+            self._accumulate_conversation(input, output)
+            await self._cp.tick()
+            return
         messages = input + [output.message]
+        last_message_count = self._last_message_counts.get(model, 0)
+        if model is not None and self._primary_model is None:
+            self._primary_model = model
+        if model is not None and model != self._primary_model:
+            self._last_message_counts[model] = len(messages)
+            await self._cp.tick()
+            return
+
         fps = [_message_fingerprint(m) for m in messages]
 
         if self._tracked_fps is None:
@@ -332,10 +518,14 @@ class AgentBridge:
             # a side call the rules below displace it later)
             self._adopt_thread(messages, output, fps, calls=1)
         elif _extends(self._tracked_fps, fps):
+            messages = _preserve_producer_messages(self.state.messages, messages)
             self._adopt_thread(messages, output, fps, calls=self._tracked_calls + 1)
         elif self._candidate_fps is not None and _extends(self._candidate_fps, fps):
             # the candidate got continued so it is a live agent loop (e.g. the
             # post-compaction conversation): promote it over the tracked thread
+            messages = _preserve_producer_messages(
+                self._candidate_messages or [], messages
+            )
             self._adopt_thread(messages, output, fps, calls=2)
         else:
             descends = self._descends_from_initial(messages, fps)
@@ -355,7 +545,7 @@ class AgentBridge:
                 # (flapping guard).
                 self._adopt_thread(messages, output, fps, calls=1)
             elif descends == self._tracked_descends and len(messages) > (
-                len(self._tracked_fps) if descends else self._last_message_count
+                len(self._tracked_fps) if descends else last_message_count
             ):
                 # legacy length heuristic. when both threads descend, compare
                 # against the tracked thread so a parked side call can't lower
@@ -367,11 +557,163 @@ class AgentBridge:
                 self._adopt_thread(messages, output, fps, calls=1)
             else:
                 self._candidate_fps = fps
+                self._candidate_messages = messages
 
-        self._last_message_count = len(messages)
+        self._last_message_counts[model] = len(messages)
 
         # tick the checkpointer
         await self._cp.tick()
+
+    def _accumulate_conversation(
+        self, input: list[ChatMessage], output: ModelOutput
+    ) -> None:
+        """Keep EVERY conversation observed over the bridge, not just the main one.
+
+        `_track_state` chooses one "main" thread because a scaffold runs one agent
+        loop and its side calls are noise. A sandbox is not a scaffold: nothing
+        constrains it to one conversation, and a human-driven or multi-invocation
+        harness routinely runs several independent ones through the same bridge (for
+        example an operator running `claude -p` several times). Choosing one then
+        silently discards the rest, and the discarded ones exist nowhere in the
+        resulting sample.
+
+        A call is matched to the conversation it CONTINUES: the one whose messages are
+        a prefix of this call's, longest first. Matching ignores only system prompts,
+        which scaffolds may rewrite per request (Claude Code stamps a per-request cache
+        token into them). Non-system message identity includes full content plus tool
+        calls and tool results, so visually identical operations do not collapse.
+
+        "Prefix" is deliberately not-strict, and re-sends are absorbed rather than
+        appended, because a repeat is not a new conversation. A call identical to one
+        already stored REPLACES it, and a call already CONTAINED in a stored
+        conversation is dropped. Requiring a strict extension instead forks a whole
+        replica on any exact repeat -- two invocations making the same deterministic
+        aux call (Claude Code's bash-path probe) fingerprint identically -- and the
+        fork can never re-merge, so it strands a permanent stale duplicate whose tail
+        then sits at the end of `state.messages`.
+
+        Only genuinely new work starts a conversation. That still admits a one-shot
+        side call, because without a session identifier a real one-shot invocation is
+        indistinguishable from an aux call and dropping it loses real work; and two
+        calls sharing a history but answering DIFFERENTLY stay separate, since merging
+        them would invent a conversation in which one prompt drew two consecutive
+        replies.
+
+        `state.output` is this call, not the last conversation's: conversations keep
+        first-seen order, so a call resuming an earlier one leaves `state.messages`
+        ending on a later conversation. Order is the property this option exists to
+        provide, so it wins, and `state.messages[-1]` is not guaranteed to be
+        `state.output`'s message. Indexing output by conversation order instead lets a
+        single late side call poison it for the rest of the run.
+        """
+        messages = input + [output.message]
+        key = _non_system([_conversation_message_fingerprint(m) for m in messages])
+        call_index = (
+            self._span_emitter.next_call_index()
+            if self._span_emitter is not None
+            else 0
+        )
+        continued: int | None = None
+        for index, conversation in enumerate(self._conversations):
+            if _is_prefix(conversation.key, key) and (
+                continued is None
+                or len(conversation.key) > len(self._conversations[continued].key)
+            ):
+                continued = index
+        if continued is None:
+            # A call already covered by a stored conversation (a re-send of an
+            # earlier turn) carries nothing the longer form does not: it joins
+            # that conversation rather than storing a replica.
+            current: _Conversation | None = None
+            for conversation in self._conversations:
+                if _is_prefix(key, conversation.key) and (
+                    current is None or len(conversation.key) > len(current.key)
+                ):
+                    current = conversation
+            if current is None:
+                current = _Conversation(
+                    key=key,
+                    messages=messages,
+                    output=output,
+                    ordinal=1
+                    + max((c.ordinal for c in self._conversations), default=-1),
+                    first_seen_call=call_index,
+                )
+                self._conversations.append(current)
+        else:
+            prior = self._conversations[continued]
+            messages = _preserve_producer_messages(prior.messages, messages)
+            current = _Conversation(
+                key=key,
+                messages=messages,
+                output=output,
+                span_id=prior.span_id,
+                ordinal=prior.ordinal,
+                first_seen_call=prior.first_seen_call,
+                resume_adopted=prior.resume_adopted,
+            )
+            self._conversations[continued] = current
+            # Absorb any other conversation this one now contains, so a fork that
+            # happened before the two met cannot persist as a stale duplicate. An
+            # absorbed conversation's span (if any) ends now: its events stay inside
+            # it, and nothing will extend it again.
+            kept: list[_Conversation] = []
+            for index, conversation in enumerate(self._conversations):
+                if index == continued or not _is_prefix(conversation.key, key):
+                    kept.append(conversation)
+                elif (
+                    conversation.span_id is not None and self._span_emitter is not None
+                ):
+                    self._span_emitter.end_span(conversation.span_id)
+            self._conversations = kept
+        if self._span_emitter is not None:
+            self._span_emitter.attribute_call(current)
+        self.state.messages = self._flattened_conversations()
+        self.state.output = output
+
+    def _flattened_conversations(self) -> list[ChatMessage]:
+        """Every conversation concatenated in first-seen order, with unique message ids.
+
+        Ids are allocated from message CONTENT (`_id_for_message`), and each request only
+        ever sees its own conversation, so independent conversations that repeat a turn --
+        replicas of one script, a re-asked prompt -- arrive carrying the SAME id, while
+        `ChatMessage.id` is documented unique.
+
+        A repeat is re-identified on a copy that is written BACK into its conversation, so
+        the new id is allocated once and then held. Re-deriving it per call instead would
+        hand the same message a different id on every generation, which defeats the id
+        stability `apply_message_ids` exists to provide and breaks every consumer that
+        joins on the id (`log/_condense.py`'s walk cache, `solver/_run.py`'s prefix diff,
+        matching `sample.messages` back to `ModelEvent.input`).
+
+        When a synthetic carrier collides with a bridge-produced assistant message, retain
+        the producer id. The carrier is an independent input and may be re-identified; the
+        output id is the identity a later `ModelEvent` uses to establish authorship.
+        """
+        flattened: list[ChatMessage] = []
+        seen: dict[str, tuple[int, int, int]] = {}
+        for conversation_index, conversation in enumerate(self._conversations):
+            for position, message in enumerate(conversation.messages):
+                if message.id is not None and (prior := seen.get(message.id)):
+                    prior_flattened, prior_conversation, prior_position = prior
+                    prior_message = flattened[prior_flattened]
+                    if _is_producer(message) and not _is_producer(prior_message):
+                        replacement_id = uuid()
+                        prior_message = prior_message.model_copy(
+                            update={"id": replacement_id}
+                        )
+                        self._conversations[prior_conversation].messages[
+                            prior_position
+                        ] = prior_message
+                        flattened[prior_flattened] = prior_message
+                        seen[replacement_id] = prior
+                    else:
+                        message = message.model_copy(update={"id": uuid()})
+                        conversation.messages[position] = message
+                if message.id is not None:
+                    seen[message.id] = (len(flattened), conversation_index, position)
+                flattened.append(message)
+        return flattened
 
     def _adopt_thread(
         self,
@@ -380,18 +722,14 @@ class AgentBridge:
         fps: list["_MessageFingerprint"],
         calls: int,
     ) -> None:
-        """Make `messages` the tracked main thread (see `_track_state`).
-
-        `calls` is the number of bridge calls attributed to the thread; a
-        stronger-descending thread may displace a weaker-anchored one-shot
-        (`calls == 1`) thread regardless of length.
-        """
+        """Make `messages` the tracked main thread (see `_track_state`)."""
         self.state.messages = messages
         self.state.output = output
         self._tracked_fps = fps
         self._tracked_calls = calls
         self._tracked_descends = self._descends_from_initial(messages, fps)
         self._candidate_fps = None
+        self._candidate_messages = None
 
     def _descends_from_initial(
         self, messages: list[ChatMessage], fps: list["_MessageFingerprint"]
@@ -458,6 +796,156 @@ class AgentBridge:
 @lru_cache(maxsize=100)
 def message_json_hash(message_json: str) -> str:
     return mm3_hash(message_json)
+
+
+class _ConversationMessageFingerprint(NamedTuple):
+    """Stable identity for accumulating one conversation's non-system messages.
+
+    Message IDs, source, metadata, and model name are transport details that may change
+    as a scaffold replays history. Every remaining field participates, preserving
+    non-text content plus tool-call and tool-result identity.
+    """
+
+    role: str
+    identity_hash: str
+
+
+def _conversation_message_fingerprint(
+    message: ChatMessage,
+) -> _ConversationMessageFingerprint:
+    """Identity of a message for conversation matching.
+
+    Content is compared by meaning, not by wire shape. The bridge's own output
+    message and the CLI's echo of it next request are the same turn, but they
+    differ in four transport-only ways, each of which made a producer message
+    never match its echo -- so every turn of one linear session started a new
+    conversation and the accumulator never extended anything:
+
+    - shape: the bridge emits `content` as a string, the CLI echoes a
+      one-element text list. A single plain text part fingerprints as its
+      string; several parts, an image or a reasoning block keep their structure,
+      which is what distinguishes them.
+    - condensation: the transcript replaces any string over 100 characters with
+      `attachment://<mm3-hash>` before the bridge sees the echo (a long sub-agent
+      prompt inside `tool_calls[].arguments`, for one). Every long string in the
+      identity is condensed the same way here, so both sides hash alike.
+    - empty content: an assistant turn that was only tool calls has `content ""`
+      on the way out and `"(no content)"` on the way back. Both fingerprint empty.
+    - `tool_calls[].view`: a render hint the bridge attaches on the way out and
+      the CLI never sends back. Presentation, not identity; dropped.
+    - tool-call ids: a transport handle, not identity. Anthropic mints one the
+      CLI echoes verbatim, so ids happened to match; Gemini's wire format has
+      none, so the bridge drops the produced id on the way out and synthesizes
+      `call_<fn>_<hash(fn, args, position)>` on the way back -- which is to say
+      that on that transport an id already means nothing but function, arguments
+      and position. Comparing ids made every Gemini turn a new conversation.
+      Identity is the function and its arguments; the tool result's
+      `tool_call_id` goes the same way. Two byte-identical parallel sub-agents
+      therefore share a conversation until their content diverges (the fork
+      rule below splits them there); their EVENTS stay distinct through the
+      sink's placement, which is the sink's job, not a transport id's.
+    - reasoning parts: a provider's thought signature, which Gemini's CLI
+      re-attaches as a redacted reasoning part the producer never emitted.
+      Stripped from identity on both sides; what remains is what was said.
+    """
+    message_identity = message.model_dump(
+        exclude={
+            "id": True,
+            "metadata": True,
+            "model": True,
+            "source": True,
+            "tool_call_id": True,
+            "tool_calls": {"__all__": {"id", "view"}},
+        },
+        exclude_none=True,
+    )
+    content = message.content
+    if isinstance(content, list):
+        content = [part for part in content if not isinstance(part, ContentReasoning)]
+        message_identity["content"] = [
+            part.model_dump(exclude_none=True) for part in content
+        ]
+    if (
+        isinstance(content, list)
+        and len(content) == 1
+        and isinstance(content[0], ContentText)
+        and content[0].refusal is None
+        and content[0].citations is None
+    ):
+        content = content[0].text
+    if isinstance(content, str):
+        message_identity["content"] = "" if content == _NO_CONTENT_ECHO else content
+    return _ConversationMessageFingerprint(
+        role=message.role,
+        identity_hash=mm3_hash(to_json_str_safe(_condensed(message_identity))),
+    )
+
+
+_NO_CONTENT_ECHO = "(no content)"
+"""How Claude Code renders an assistant turn that carried only tool calls."""
+
+_CONDENSE_OVER_CHARS = 100
+"""Transcript condensation threshold (`inspect_ai.log._condense`: text > 100)."""
+
+
+def _condensed(value: object) -> object:
+    """The value with every string the transcript would condense, condensed."""
+    if isinstance(value, str):
+        if len(value) > _CONDENSE_OVER_CHARS and not value.startswith(
+            ATTACHMENT_PROTOCOL
+        ):
+            return f"{ATTACHMENT_PROTOCOL}{mm3_hash(value)}"
+        return value
+    if isinstance(value, dict):
+        return {k: _condensed(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_condensed(v) for v in value]
+    return value
+
+
+def _is_producer(message: ChatMessage) -> bool:
+    """Whether a message is a bridge model output with attribution authority."""
+    return isinstance(message, ChatMessageAssistant) and message.source == "generate"
+
+
+def _preserve_producer_messages(
+    previous: list[ChatMessage], messages: list[ChatMessage]
+) -> list[ChatMessage]:
+    """Reuse producer messages from an exactly continued non-system prefix.
+
+    Request conversion synthesizes inbound ids, source, and metadata. Those transport
+    fields cannot identify a continuation, so only semantic wire content participates.
+    Systems are also excluded because native CLIs may rewrite them per request. A mismatch
+    leaves the converted request untouched rather than inferring producer identity.
+    """
+    previous_non_system = [
+        (index, message)
+        for index, message in enumerate(previous)
+        if message.role != "system"
+    ]
+    message_non_system = [
+        (index, message)
+        for index, message in enumerate(messages)
+        if message.role != "system"
+    ]
+    if len(previous_non_system) > len(message_non_system):
+        return messages
+    if any(
+        _conversation_message_fingerprint(previous_message)
+        != _conversation_message_fingerprint(message)
+        for (_, previous_message), (_, message) in zip(
+            previous_non_system, message_non_system
+        )
+    ):
+        return messages
+
+    preserved = messages.copy()
+    for (_, previous_message), (message_index, _) in zip(
+        previous_non_system, message_non_system
+    ):
+        if _is_producer(previous_message):
+            preserved[message_index] = previous_message
+    return preserved
 
 
 class _MessageFingerprint(NamedTuple):
@@ -582,6 +1070,510 @@ def _condensed_fingerprint(fp: _MessageFingerprint) -> _MessageFingerprint:
     return _MessageFingerprint(
         role=fp.role, text_hash=mm3_hash(f"{ATTACHMENT_PROTOCOL}{fp.text_hash}")
     )
+
+
+@dataclass
+class _Conversation:
+    """One conversation observed over the bridge (see `_accumulate_conversation`).
+
+    `key`/`messages`/`output` are accumulator-owned; `span_id`/`ordinal`/
+    `first_seen_call`/`resume_adopted` are owned by `_ConversationSpanEmitter`.
+    The span fields default for snapshots written before span emission existed,
+    and `span_id` is reset on every checkpoint restore (see
+    `AgentBridge.__init__`).
+    """
+
+    key: list[_ConversationMessageFingerprint]
+    messages: list[ChatMessage]
+    output: ModelOutput
+    span_id: str | None = None
+    ordinal: int = 0
+    first_seen_call: int = 0
+    resume_adopted: bool = False
+
+
+BRIDGE_CONVERSATION_SPAN_TYPE = "conversation"
+"""Span type for accumulated bridge conversations.
+
+The type consumers of bridged conversation spans already read; timeline
+classification (`span_type == "agent"`) is intentionally not claimed here —
+flipping the type is a consumer-visible change reserved for the release that
+stops flattening conversations into `state.messages`.
+"""
+
+
+class _CallRecord(NamedTuple):
+    """One bridged call's emitted events and their emission-time parent span.
+
+    Lives in a task-local ContextVar: the sandbox service runs one handler task
+    per request, so the record's lifetime is exactly the call's — a handler
+    that fails before accumulating dies with its record, leaking nothing and
+    never mis-attributing to a reused task id.
+    """
+
+    parent_id: str | None
+    events: list["ModelEvent"]
+
+
+_call_record: ContextVar[_CallRecord | None] = ContextVar(
+    "_bridge_call_record", default=None
+)
+
+
+class _ConversationSpanEmitter:
+    """Emit one transcript span per accumulated conversation.
+
+    Installed as the bridge's `model_event_sink` when `accumulate_conversations`
+    is set, so `_record_model_interaction` routes each bridged `ModelEvent` here
+    instead of emitting it to the transcript directly. The emitter does no
+    conversation matching of its own: events are emitted immediately under their
+    ambient span and remembered per handler task, and `_accumulate_conversation`
+    — the only authoritative matcher — attributes them to the resolved
+    conversation's span after each call. Attribution by task rather than by
+    content is what keeps a compacted, filter-rewritten, or approval-retried
+    call's events in the conversation the accumulator chose: the request task
+    that generated the events is the request task that accumulates them, no
+    matter how the model input was transformed in between.
+
+    Span metadata (`conversation_ordinal`, `first_seen_call_index`,
+    `resume_adopted`) rides in an `InfoEvent` emitted inside the span with
+    `source="bridge_conversation"`. Producer message identity is carried by the
+    message ids themselves (see `_flattened_conversations`), not repeated here.
+    `first_seen_call_index` is process-local: it restarts after a resume, and
+    `resume_adopted` marks the discontinuity.
+    """
+
+    def __init__(self, bridge: "AgentBridge", *, writes_events: bool = True) -> None:
+        self._bridge = bridge
+        self._span_ids: list[str] = []
+        self._calls_seen = 0
+        self._closed = False
+        # Standalone, the emitter is the transcript writer for bridged events.
+        # Composed with a caller sink (`_ComposedModelEventSink`), the sink
+        # writes and the emitter only records membership and re-parents.
+        self._writes_events = writes_events
+        # Composed only: events the sink was still HOLDING when their call was
+        # attributed, keyed by id(event) -> (conversation span, ambient at
+        # emission). Placed when the sink finally writes them, if it wrote them
+        # back at the ambient rather than somewhere of its own choosing.
+        self._deferred: dict[int, tuple[str, str | None]] = {}
+        # Composed only: for every arrival span some event has been moved out
+        # of, the conversation of the most recent moved event that ISSUED A TOOL
+        # CALL there. A sink that opens a sub-agent span under a parent call's
+        # arrival span -- possibly requests later, when the child's own first
+        # call comes in -- names a span whose events have since moved; the child
+        # follows the call that could have spawned it. A side call with no tool
+        # calls (a title generation) leaving the same span does not displace it.
+        self._rehomed: dict[str, str] = {}
+        # Spans written after this emitter first subscribed to the transcript:
+        # a sink's own placement tree, never the harness's ambient spans, which
+        # were open before any bridged call (see `_adopt_placement`).
+        self._late_spans: dict[str, "SpanBeginEvent"] = {}
+        # A placing sink's ambient, claimed by the conversation of the last
+        # tool-calling event whose placement tree was rooted there: the trees a
+        # sink roots there afterwards -- a sub-agent's scheduling and calls --
+        # are that call's doing and nest under its conversation, as a sink-opened
+        # `agent` span does under the ambient a tool-calling call vacated.
+        self._claimed_roots: dict[str, str] = {}
+        self._unsubscribe: Callable[[], None] | None = None
+
+    def on_pending(self, event: "ModelEvent") -> None:
+        from inspect_ai.log._transcript import transcript
+
+        if self._writes_events:
+            transcript()._event(event)
+        self.record(event)
+
+    def on_complete(self, event: "ModelEvent") -> None:
+        from inspect_ai.log._transcript import transcript
+
+        if self._writes_events:
+            transcript()._event_updated(event)
+
+    def record(self, event: "ModelEvent") -> None:
+        """Remember ``event`` as part of the handler task's bridged call.
+
+        The parent recorded here is the AMBIENT span at emission time: the span
+        the bridge is running under when the call arrives. It is read now, not
+        at attribution, because a concurrent handler may rotate the ambient
+        span in between. It is deliberately not `event.span_id`: standalone the
+        two agree, but composed with a caller sink the event has not been
+        placed yet when it is recorded (recording runs first, so the sink's
+        placement is not mistaken for the emission context), and a sink that
+        holds the event may later place it under a sub-agent span -- a child
+        of the conversation, never the conversation's parent.
+        """
+        from inspect_ai.util._span import current_span_id
+
+        if self._closed:
+            return
+        record = _call_record.get()
+        if record is None:
+            record = _CallRecord(parent_id=current_span_id(), events=[])
+            _call_record.set(record)
+        record.events.append(event)
+
+    def _on_written(self, event: "Event") -> None:
+        """React to the sink's writes: place released events, re-home late child spans.
+
+        A sink that held an event past attribution and then wrote it back at the
+        ambient span decided it was NOT a sub-agent's, so the conversation span
+        its call was attributed to is its home. Written anywhere else, the sink's
+        placement stands (see `attribute_call`). Runs inside the transcript's
+        write, which guards re-entrancy, so the update here does not recurse.
+        """
+        from inspect_ai.event import ModelEvent, SpanBeginEvent
+
+        if isinstance(event, SpanBeginEvent):
+            self._late_spans[event.id] = event
+            target = self._rehomed.get(event.parent_id or "")
+            if target is not None:
+                self._rehome_child(event, event.parent_id or "", target)
+            return
+        deferred = self._deferred.pop(id(event), None)
+        if deferred is None or not isinstance(event, ModelEvent):
+            return
+        span_id, ambient = deferred
+        if span_id not in self._span_ids:
+            return
+        if event.span_id == ambient:
+            self._move_event(event, span_id)
+        else:
+            self._adopt_placement(event, span_id)
+
+    def next_call_index(self) -> int:
+        """The zero-based index of the bridged call being accumulated."""
+        index = self._calls_seen
+        self._calls_seen += 1
+        return index
+
+    def attribute_call(self, conversation: _Conversation) -> None:
+        """Stamp the current call's events into the conversation's span.
+
+        Runs in the same handler task that emitted the events (the API shims
+        call `_track_state` after `bridge_generate` returns), so the task-local
+        record is exactly this call's events — including approval retries,
+        which generate more than once before the call accumulates. A filtered
+        call recorded no events; the conversation still gets its span so every
+        accumulated conversation is represented in the transcript.
+
+        Composed with a caller sink, only events the sink has already written
+        are re-parented. An event the sink is still holding — a sub-agent call
+        awaiting the native identity that names its span — keeps the sink's
+        placement when the sink writes it: that identity is exact where the
+        prefix match is not, so it is adopted in place of the conversation
+        span, never alongside it as a second span for the same event.
+        """
+        from inspect_ai.log._transcript import transcript
+
+        record = _call_record.get()
+        _call_record.set(None)
+        if self._closed:
+            return
+        span_id = self._ensure_span(
+            conversation,
+            parent_id=record.parent_id if record is not None else None,
+            parent_known=record is not None,
+        )
+        if record is None:
+            return
+        for event in record.events:
+            if not self._writes_events:
+                if not transcript()._is_resident(event):
+                    # The sink is still holding it. Whichever of the sink's paths
+                    # finally writes it (a completion callback, a native-transcript
+                    # drain, a JSONL record) goes through the transcript, so the
+                    # transcript's write hook is the one place to catch the release.
+                    self._deferred[id(event)] = (span_id, record.parent_id)
+                    if self._unsubscribe is None:
+                        self._unsubscribe = transcript()._subscribe(self._on_written)
+                    continue
+                # The sink wrote it. If it also PLACED it -- anywhere but the
+                # ambient span the call arrived under -- that placement is an
+                # identity decision (a sub-agent span named by the CLI's own
+                # records), adopted in place of the conversation span, never
+                # beside it. An event still sitting at the ambient was written
+                # without a placement of its own, and the conversation is its home.
+                if event.span_id != record.parent_id:
+                    self._adopt_placement(event, span_id)
+                    continue
+            self._move_event(event, span_id)
+
+    def _adopt_placement(self, event: "ModelEvent", span_id: str) -> None:
+        """Hang a sink-placed event's span tree under its conversation.
+
+        A sink that places every event in a span tree of its own -- Gemini's
+        consumer rebuilds the CLI's native trace, `model` spans under `tool`
+        and `agent` spans -- roots that tree at ITS ambient, the span current
+        in the consumer's task, which is neither the bridge's ambient nor any
+        conversation. The placement is kept (it is the sink's identity
+        decision); its topmost span of the sink's own making is re-parented
+        onto the conversation the event was attributed to, so the contract
+        that every bridged event is owned by exactly one conversation holds
+        for a placing sink too. Only spans written since this emitter began
+        listening are the sink's; the harness's own spans -- open before any
+        bridged call -- are never moved. A tree already under a conversation
+        (this one or another sub-agent's) stays where it is.
+
+        Which conversation: the one that claimed the tree's root ambient, else
+        the event's own. A call that issued tool calls claims the ambient its
+        tree was rooted at, so a sub-agent's tree rooted there afterwards nests
+        under the PARENT call's conversation -- the shape a sink-opened `agent`
+        span already has (see `_move_event`), and the one the sub-agent's own
+        conversation span then sits beside, as its `bridge_conversation` record
+        says. Gemini's trace has no edge from a call to the tool scheduling it
+        caused; this is the one place that edge is known, so this is where it
+        is drawn.
+        """
+        from inspect_ai.event import SpanBeginEvent
+        from inspect_ai.log._transcript import transcript
+
+        if self._unsubscribe is None:
+            self._unsubscribe = transcript()._subscribe(self._on_written)
+        # The spans this emitter watched being written, then the resident ones --
+        # never `transcript().events`, which on a bounded transcript rebuilds the
+        # whole history from the buffer database on every placement, and hands back
+        # copies whose re-parenting is written to a discarded object. Watched spans
+        # are consulted first: `_event_updated` identifies residency by uuid rather
+        # than identity, so a resident id can carry an object this emitter never saw,
+        # and the watched one is the object whose move will be recorded. Looked up per
+        # node rather than merged, because the watched set grows for the life of the
+        # session while the resident map is bounded.
+        #
+        # An ancestor in neither cannot be resolved, and a span this emitter re-homed
+        # earlier may since have been evicted, so an unresolved ancestor could be
+        # hiding a conversation span that would stop the walk. Once the history is
+        # truncated, leave such a tree alone rather than re-root it on a guess; with
+        # the full history in memory, an unresolved ancestor is the top of the tree,
+        # as before.
+        resident_spans = {
+            begin.id: begin
+            for begin in transcript().history.resident_events
+            if isinstance(begin, SpanBeginEvent)
+        }
+        node = event.span_id
+        root: SpanBeginEvent | None = None
+        seen: set[str] = set()
+        while node is not None and node not in seen:
+            seen.add(node)
+            if node in self._span_ids:
+                return
+            begin = self._late_spans.get(node) or resident_spans.get(node)
+            if begin is None:
+                if transcript().history.resident_events_truncated:
+                    return
+                break
+            if node in self._late_spans:
+                root = begin
+            node = begin.parent_id
+        if root is None:
+            return
+        ambient = root.parent_id or ""
+        target = self._claimed_roots.get(ambient, span_id)
+        root.parent_id = target
+        root.span_id = target
+        transcript()._event_updated(root)
+        if any(choice.message.tool_calls for choice in event.output.choices):
+            self._claimed_roots[ambient] = target
+
+    def _move_event(self, event: "ModelEvent", span_id: str) -> None:
+        """Move an event into its conversation span, carrying its child spans along.
+
+        A sink may open a sub-agent span under the event's span at completion
+        time -- which is BEFORE attribution, so it read the span the event
+        arrived under, not the conversation it turns out to belong to. Left
+        alone, the conversation and the sub-agent tree it spawned would sit as
+        siblings and nothing would record which conversation spawned it. Any
+        `agent` span begun under the event's former span after the event was
+        written, and not yet re-homed, moves with it.
+        """
+        from inspect_ai.event import SpanBeginEvent
+        from inspect_ai.log._transcript import transcript
+
+        former = event.span_id
+        event.span_id = span_id
+        transcript()._event_updated(event)
+        if former == span_id or self._writes_events or former is None:
+            return
+        # Only a call that ISSUED tool calls can have spawned a sub-agent, so only
+        # such a call claims its arrival span for later children. A tool-less call
+        # leaving the same span -- a version probe, a title generation -- claims
+        # nothing, whether it left first or last.
+        if any(choice.message.tool_calls for choice in event.output.choices):
+            self._rehomed[former] = span_id
+        if self._unsubscribe is None:
+            self._unsubscribe = transcript()._subscribe(self._on_written)
+        # The resident events, never `transcript().events`: on a bounded transcript
+        # the latter serves the whole logical history from the buffer database, which
+        # costs O(history) on every event written and hands back rebuilt events that
+        # no `is` test can match. An event still being appended is not resident yet
+        # and nothing follows it; one already evicted cannot be located here either,
+        # and both leave the tail alone. A child evicted before its parent was
+        # attributed is not re-homed: against a history provider that costs nothing
+        # real, since the rebuilt events it served never matched `is` either. A
+        # bounded transcript with no provider is the one shape that could re-home
+        # from the full list, and no sample runs in it.
+        events = transcript().history.resident_events
+        start = next(
+            (index for index in reversed(range(len(events))) if events[index] is event),
+            None,
+        )
+        if start is None:
+            return
+        for child in events[start + 1 :]:
+            if isinstance(child, SpanBeginEvent):
+                self._rehome_child(child, former, span_id)
+
+    def _rehome_child(self, child: "SpanBeginEvent", former: str, span_id: str) -> None:
+        """Move a sink-opened sub-agent span from a vacated arrival span to the conversation."""
+        from inspect_ai.log._transcript import transcript
+
+        if child.type == "agent" and child.parent_id == former:
+            child.parent_id = span_id
+            child.span_id = span_id
+            transcript()._event_updated(child)
+
+    def end_span(self, span_id: str) -> None:
+        """End one conversation's span (absorption: nothing extends it again)."""
+        from inspect_ai.event import SpanEndEvent
+        from inspect_ai.log._transcript import transcript
+
+        if span_id in self._span_ids:
+            self._span_ids.remove(span_id)
+            transcript()._event(SpanEndEvent(id=span_id))
+
+    def close(self) -> None:
+        """End every open conversation span. Idempotent."""
+        from inspect_ai.event import SpanEndEvent
+        from inspect_ai.log._transcript import transcript
+
+        if self._closed:
+            return
+        self._closed = True
+        for span_id in reversed(self._span_ids):
+            transcript()._event(SpanEndEvent(id=span_id))
+        self._span_ids.clear()
+        self._deferred.clear()
+        self._rehomed.clear()
+        self._claimed_roots.clear()
+        self._late_spans.clear()
+        if self._unsubscribe is not None:
+            self._unsubscribe()
+            self._unsubscribe = None
+        _call_record.set(None)
+
+    def _ensure_span(
+        self, conversation: _Conversation, *, parent_id: str | None, parent_known: bool
+    ) -> str:
+        """The conversation's span, minted on first attribution.
+
+        A conversation without a span was just created, was restored from a
+        checkpoint (its span closed with the process that opened it — the fresh
+        span is the adoption `resume_adopted` records), or was created by a
+        filtered call that never generated.
+        """
+        if conversation.span_id is None:
+            conversation.span_id = self._open_span(
+                conversation, parent_id=parent_id, parent_known=parent_known
+            )
+        return conversation.span_id
+
+    def _open_span(
+        self, conversation: _Conversation, *, parent_id: str | None, parent_known: bool
+    ) -> str:
+        """Open the conversation's span under its events' emission-time parent.
+
+        The parent is the span the call's events were emitted under, recorded at
+        emission: attribution runs later in the handler task, and a concurrent
+        handler may have rotated the ambient checkpoint span in between — reading
+        the ambient at attribution time would reparent events across checkpoints.
+        A filtered call emitted nothing, so the attribution-time ambient is the
+        only parent there is. `None` is legal — the span then becomes a tree
+        root, which is what an unspanned sample wants.
+        """
+        from inspect_ai.event import InfoEvent, SpanBeginEvent
+        from inspect_ai.log._transcript import transcript
+        from inspect_ai.util._span import current_span_id
+
+        if not parent_known:
+            parent_id = current_span_id()
+        span_id = uuid()
+        begin = SpanBeginEvent(
+            id=span_id,
+            parent_id=parent_id,
+            span_id=parent_id,
+            type=BRIDGE_CONVERSATION_SPAN_TYPE,
+            name=f"conversation {conversation.ordinal}",
+        )
+        # A captured None parent is authoritative (root span): construction fills
+        # a None span_id from the ambient span, which may be an unrelated later
+        # checkpoint by attribution time — restore the captured value.
+        begin.span_id = parent_id
+        transcript()._event(begin)
+        transcript()._event(
+            InfoEvent(
+                source="bridge_conversation",
+                span_id=span_id,
+                data={
+                    "conversation_ordinal": conversation.ordinal,
+                    "first_seen_call_index": conversation.first_seen_call,
+                    "resume_adopted": conversation.resume_adopted,
+                },
+            )
+        )
+        self._span_ids.append(span_id)
+        return span_id
+
+
+class _ComposedModelEventSink:
+    """Route each bridged `ModelEvent` to both the span emitter and a caller sink.
+
+    The caller's sink is the writer: it decides when the event reaches the
+    transcript and under which span, exactly as it does without accumulation.
+    The emitter only records the event as part of the handler task's call, so
+    that `attribute_call` can move the events the sink wrote into their
+    conversation's span. Recording runs first so the emitter sees the span the
+    event was emitted under, before the sink has moved it.
+    """
+
+    def __init__(
+        self, emitter: _ConversationSpanEmitter, sink: "ModelEventSink"
+    ) -> None:
+        self._emitter = emitter
+        self._sink = sink
+
+    def on_pending(self, event: "ModelEvent") -> None:
+        self._emitter.record(event)
+        self._sink.on_pending(event)
+
+    def on_complete(self, event: "ModelEvent") -> None:
+        self._sink.on_complete(event)
+
+
+def _is_prefix(
+    prefix: list[_ConversationMessageFingerprint],
+    fps: list[_ConversationMessageFingerprint],
+) -> bool:
+    """Whether `fps` continues `prefix`, or is exactly it."""
+    return len(fps) >= len(prefix) and fps[: len(prefix)] == prefix
+
+
+def _non_system(
+    fps: list[_ConversationMessageFingerprint],
+) -> list[_ConversationMessageFingerprint]:
+    """Fingerprints of the non-system messages, for conversation-continuation matching.
+
+    A scaffold may rewrite its system prompt on every request -- Claude Code stamps a
+    per-request cache token into it -- so successive calls in one conversation need not
+    share a system-message fingerprint, and matching on it would make every call look
+    like a new conversation.
+
+    Used only by `_accumulate_conversation`. Main-thread tracking keeps comparing whole
+    message lists: a system prompt still carries meaning there (two sub-agents can share
+    a user prompt while differing only in role), and its `_extends` check is backed by the
+    length and descent heuristics rather than standing alone.
+    """
+    return [fp for fp in fps if fp.role != "system"]
 
 
 def _extends(prefix: list[_MessageFingerprint], fps: list[_MessageFingerprint]) -> bool:

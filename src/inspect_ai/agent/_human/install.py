@@ -33,6 +33,7 @@ refused even here: no earlier release left a rootless installation to repair, an
 the fallback may itself be running as root.
 """
 
+import ast
 import inspect
 import stat
 from textwrap import dedent
@@ -256,6 +257,36 @@ async def append_bashrc(
         )
 
 
+def _strip_type_only_override_decorators(source: str) -> str:
+    handler = ast.parse(source).body[0]
+    if not isinstance(handler, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        raise ValueError("Expected a command handler function")
+
+    line_offsets = [0]
+    for line in source.splitlines(keepends=True):
+        line_offsets.append(line_offsets[-1] + len(line))
+
+    decorator_ranges: list[tuple[int, int]] = []
+    for decorator in handler.decorator_list:
+        if isinstance(decorator, ast.Name) and decorator.id == "override":
+            assert decorator.end_lineno is not None
+            assert decorator.end_col_offset is not None
+            line_start = line_offsets[decorator.lineno - 1]
+            decorator_start = source.rfind(
+                "@", line_start, line_start + decorator.col_offset
+            )
+            assert decorator_start != -1
+            decorator_end = (
+                line_offsets[decorator.end_lineno - 1] + decorator.end_col_offset
+            )
+            decorator_ranges.append((decorator_start, decorator_end))
+
+    for decorator_start, decorator_end in reversed(decorator_ranges):
+        source = source[:decorator_start] + source[decorator_end:]
+
+    return source
+
+
 def human_agent_commands(commands: list[HumanAgentCommand]) -> str:
     # filter out hidden commands
     commands = [command for command in commands if "cli" in command.contexts]
@@ -276,10 +307,16 @@ def human_agent_commands(commands: list[HumanAgentCommand]) -> str:
         return f"{hours:.0f}:{minutes:02.0f}:{seconds:02.0f}"
     """)
 
-    # command handler source code (extracted from call methods)
+    # Command methods execute in task.py, not their defining modules. Remove
+    # type-only override decorators because task.py deliberately does not import
+    # command implementation typing symbols.
     command_handlers = "\n\n".join(
-        dedent(
-            inspect.getsource(command.cli).replace("cli(self, ", f"{command.name}(", 1)
+        _strip_type_only_override_decorators(
+            dedent(
+                inspect.getsource(command.cli).replace(
+                    "cli(self, ", f"{command.name}(", 1
+                )
+            )
         )
         for command in commands
     )

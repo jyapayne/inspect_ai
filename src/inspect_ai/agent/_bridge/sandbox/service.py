@@ -1,5 +1,5 @@
 from logging import getLogger  # noqa: E402
-from typing import Awaitable, Callable, Sequence, cast
+from typing import Awaitable, Callable, Protocol, Sequence, cast
 
 import anyio
 from pydantic import JsonValue, TypeAdapter
@@ -14,8 +14,9 @@ from inspect_ai.tool._tools._web_search._web_search import WebSearchProviders
 from inspect_ai.util._limit import LimitExceededError
 from inspect_ai.util._sandbox import SandboxEnvironment, sandbox_service
 
-from .._errors import PROVIDER_ERROR_KEY, provider_error_payload
+from .._errors import PROVIDER_ERROR_KEY, ResponseFilterError, provider_error_payload
 from ..anthropic_api import inspect_anthropic_api_request
+from ..bridge import filter_bridge_headers
 from ..completions import inspect_completions_api_request
 from ..google_api import inspect_google_api_request
 from ..responses import inspect_responses_api_request
@@ -26,7 +27,17 @@ logger = getLogger(__name__)
 MODEL_SERVICE = "bridge_model_service"
 JSON_VALUE_ADAPTER: TypeAdapter[JsonValue] = TypeAdapter(JsonValue)
 
-GenerateMethod = Callable[[dict[str, JsonValue]], Awaitable[dict[str, JsonValue]]]
+RequestHeaders = dict[str, str] | None
+
+
+class GenerateMethod(Protocol):
+    async def __call__(
+        self,
+        json_data: dict[str, JsonValue],
+        headers: RequestHeaders = None,
+        *,
+        metadata_headers: RequestHeaders = None,
+    ) -> dict[str, JsonValue]: ...
 
 
 def _forward_provider_errors(
@@ -40,7 +51,10 @@ def _forward_provider_errors(
     and stay up, instead of the RPC `error` channel triggering a fatal exit.
 
     `LimitExceededError` is deliberately excluded so message/token/cost limit
-    hit during generation properly end the sample.
+    hit during generation properly end the sample. `ResponseFilterError` is
+    excluded for the same reason: a `response_filter` is eval logic, not a
+    passive observer, so its failures fail the sample rather than reaching
+    the scaffold as a model API error it might retry against forever.
 
     A `ModelRefusalError` (`fail_on_refusal`) must also end the sample, but the
     sandbox service dispatcher would swallow a re-raise into an RPC error, so it
@@ -50,10 +64,13 @@ def _forward_provider_errors(
 
     async def generate_forwarding_errors(
         json_data: dict[str, JsonValue],
+        headers: RequestHeaders = None,
+        *,
+        metadata_headers: RequestHeaders = None,
     ) -> dict[str, JsonValue]:
         try:
-            return await generate(json_data)
-        except LimitExceededError:
+            return await generate(json_data, headers, metadata_headers=metadata_headers)
+        except (LimitExceededError, ResponseFilterError):
             raise
         except ModelRefusalError as ex:
             bridge.request_fail(ex)
@@ -116,9 +133,19 @@ async def run_model_service(
 
 def generate_completions(
     bridge: SandboxAgentBridge,
-) -> Callable[[dict[str, JsonValue]], Awaitable[dict[str, JsonValue]]]:
-    async def generate(json_data: dict[str, JsonValue]) -> dict[str, JsonValue]:
-        completion = await inspect_completions_api_request(json_data, None, bridge)
+) -> GenerateMethod:
+    async def generate(
+        json_data: dict[str, JsonValue],
+        headers: RequestHeaders = None,
+        *,
+        metadata_headers: RequestHeaders = None,
+    ) -> dict[str, JsonValue]:
+        completion = await inspect_completions_api_request(
+            json_data,
+            filter_bridge_headers(headers),
+            bridge,
+            metadata_headers=metadata_headers,
+        )
         return completion.model_dump(mode="json", warnings=False)
 
     return generate
@@ -128,10 +155,20 @@ def generate_responses(
     web_search: WebSearchProviders | None,
     code_execution: CodeExecutionProviders | None,
     bridge: SandboxAgentBridge,
-) -> Callable[[dict[str, JsonValue]], Awaitable[dict[str, JsonValue]]]:
-    async def generate(json_data: dict[str, JsonValue]) -> dict[str, JsonValue]:
+) -> GenerateMethod:
+    async def generate(
+        json_data: dict[str, JsonValue],
+        headers: RequestHeaders = None,
+        *,
+        metadata_headers: RequestHeaders = None,
+    ) -> dict[str, JsonValue]:
         completion = await inspect_responses_api_request(
-            json_data, None, web_search, code_execution, bridge
+            json_data,
+            filter_bridge_headers(headers),
+            web_search,
+            code_execution,
+            bridge,
+            metadata_headers=metadata_headers,
         )
         return completion.model_dump(mode="json", warnings=False)
 
@@ -142,10 +179,20 @@ def generate_anthropic(
     web_search: WebSearchProviders | None,
     code_execution: CodeExecutionProviders | None,
     bridge: SandboxAgentBridge,
-) -> Callable[[dict[str, JsonValue]], Awaitable[dict[str, JsonValue]]]:
-    async def generate(json_data: dict[str, JsonValue]) -> dict[str, JsonValue]:
+) -> GenerateMethod:
+    async def generate(
+        json_data: dict[str, JsonValue],
+        headers: RequestHeaders = None,
+        *,
+        metadata_headers: RequestHeaders = None,
+    ) -> dict[str, JsonValue]:
         completion = await inspect_anthropic_api_request(
-            json_data, None, web_search, code_execution, bridge
+            json_data,
+            filter_bridge_headers(headers),
+            web_search,
+            code_execution,
+            bridge,
+            metadata_headers=metadata_headers,
         )
         return completion.model_dump(mode="json", warnings=False)
 
@@ -156,10 +203,20 @@ def generate_google(
     web_search: WebSearchProviders | None,
     code_execution: CodeExecutionProviders | None,
     bridge: SandboxAgentBridge,
-) -> Callable[[dict[str, JsonValue]], Awaitable[dict[str, JsonValue]]]:
-    async def generate(json_data: dict[str, JsonValue]) -> dict[str, JsonValue]:
+) -> GenerateMethod:
+    async def generate(
+        json_data: dict[str, JsonValue],
+        headers: RequestHeaders = None,
+        *,
+        metadata_headers: RequestHeaders = None,
+    ) -> dict[str, JsonValue]:
         completion = await inspect_google_api_request(
-            json_data, web_search, code_execution, bridge
+            json_data,
+            filter_bridge_headers(headers),
+            web_search,
+            code_execution,
+            bridge,
+            metadata_headers=metadata_headers,
         )
         return completion
 

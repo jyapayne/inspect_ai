@@ -17,6 +17,7 @@ import anyio
 import httpx
 import semver
 from rich.prompt import Prompt
+from tenacity import RetryError
 
 import inspect_ai
 from inspect_ai._util.download import download
@@ -710,6 +711,27 @@ async def _download_from_s3(filename: str) -> bool:
             f"compromised or corrupted artifact — please report this to "
             f"the inspect_ai maintainers rather than retrying."
         ) from e
+    except RetryError as e:
+        # download() retries transport errors and 5xx responses before giving
+        # up, and tenacity then wraps the final failure. The handlers below
+        # classify that failure (404 -> not published, unreachable bucket ->
+        # local build), so surface it rather than the wrapper.
+        final = e.last_attempt.exception()
+        if final is None:
+            raise
+        if isinstance(final, httpx.HTTPStatusError) and final.response.status_code in (
+            403,
+            404,
+        ):
+            print(f"Executable '{filename}' not found on S3")
+            return False
+        if isinstance(final, httpx.TransportError):
+            logger.warning(
+                f"Failed to reach sandbox-tools bucket for '{filename}' ({final}); "
+                "falling back to a local build."
+            )
+            return False
+        raise final from e
     except httpx.HTTPStatusError as e:
         if e.response.status_code in (403, 404):
             print(f"Executable '{filename}' not found on S3")

@@ -400,6 +400,90 @@ async def test_oserror_custom_message_preserved():
     assert "Workspace file 'config.yaml' missing" in messages[-1].error.message
 
 
+class CitationArg(BaseModel):
+    """A structured argument whose published schema is looser than its own validation.
+
+    `Literal` with a default publishes as a plain string carrying that default, so the
+    schema check a tool call passes through first accepts any string for `kind`.
+    """
+
+    kind: Literal["document"] = "document"
+    title: str
+
+
+@tool
+def record_citation():
+    async def record_citation(citation: CitationArg, when: date | None = None) -> str:
+        """Record a citation.
+
+        Args:
+            citation (CitationArg): The citation to record.
+            when (date): The date it was recorded.
+        """
+        return f"recorded {citation.title}"
+
+    return record_citation
+
+
+async def _record_citation(**arguments: Any) -> ChatMessageTool:
+    tool_def = ToolDef(record_citation())
+    call = make_call("record_citation", arguments)
+    messages, _ = await execute_tools(
+        [ChatMessageAssistant(content=[], tool_calls=[call])], [tool_def]
+    )
+    message = messages[-1]
+    assert isinstance(message, ChatMessageTool)
+    return message
+
+
+async def test_schema_valid_but_model_invalid_argument_does_not_kill_the_sample():
+    """A model filling an argument with a value its schema allowed gets to retry.
+
+    Arguments are checked against the tool's JSON schema before they are constructed, so a
+    wrongly typed field is already a retryable parsing error. A field whose schema is looser
+    than the type behind it is not: `Literal` with a default publishes as a plain string and
+    a date only as a format the validator does not enforce, so the value reaches the
+    constructor and the type rejects it. Raised, that ended the sample and discarded every
+    turn before it.
+    """
+    transcript = Transcript()
+    init_transcript(transcript)
+
+    message = await _record_citation(
+        citation={"kind": "file", "title": "/etc/conf.yaml"}
+    )
+
+    assert message.error is not None
+    assert message.error.type == "parsing"
+    # the model is told the parameter, the field and the constraint, which is the whole
+    # point of returning the error rather than raising it
+    assert "citation" in message.error.message
+    assert "kind: Input should be 'document'" in message.error.message
+
+    # the tool call must still be in the transcript: every other early failure records its
+    # pending event before raising, and a ChatMessageTool with no ToolEvent is invisible to
+    # the log viewer, to hooks, and to any analysis that walks events
+    tool_events = [e for e in transcript.events if isinstance(e, ToolEvent)]
+    assert len(tool_events) == 1
+    assert tool_events[0].error is not None
+    assert tool_events[0].error.type == "parsing"
+
+
+async def test_a_bad_date_argument_does_not_kill_the_sample_either():
+    """`date`/`time`/`datetime` raise `ValueError`, not `ValidationError`.
+
+    Their schemas publish only a `format`, which the input validator does not enforce, so
+    this is the same class reached through a different constructor.
+    """
+    message = await _record_citation(
+        citation={"kind": "document", "title": "/etc/conf.yaml"}, when="not-a-date"
+    )
+
+    assert message.error is not None
+    assert message.error.type == "parsing"
+    assert "when" in message.error.message
+
+
 async def test_sandbox_timeout_partial_output_returned_as_tool_result():
     """SandboxTimeoutError partial output is returned with a timeout tool error."""
     tool_def = ToolDef(sandbox_timeout_tool())

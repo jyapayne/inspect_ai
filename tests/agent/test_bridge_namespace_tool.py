@@ -134,7 +134,7 @@ def test_response_function_tool_call_preserves_namespace():
             ToolCall(id="call-2", function="search", arguments={"q": "x"}),
         ],
     )
-    tool_namespaces = {"submit_pov": "submit"}
+    tool_namespaces = {"submit_pov": ("submit_pov", "submit")}
     items = responses_output_items_from_assistant_message(message, tool_namespaces)
     function_calls = [
         item for item in items if getattr(item, "type", None) == "function_call"
@@ -175,7 +175,7 @@ def test_response_custom_tool_call_preserves_namespace():
             ),
         ],
     )
-    tool_namespaces = {"apply_patch": "codex"}
+    tool_namespaces = {"apply_patch": ("apply_patch", "codex")}
     items = responses_output_items_from_assistant_message(message, tool_namespaces)
     custom_calls = {
         item.name: item for item in items if item.type == "custom_tool_call"
