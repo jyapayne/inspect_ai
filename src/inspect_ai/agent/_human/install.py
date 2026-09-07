@@ -276,13 +276,15 @@ def human_agent_commands(commands: list[HumanAgentCommand]) -> str:
         return f"{hours:.0f}:{minutes:02.0f}:{seconds:02.0f}"
     """)
 
-    # command handler source code (extracted from call methods)
+    # Command methods execute in task.py, not their defining modules. Remove
+    # type-only override decorators because task.py deliberately does not import
+    # command implementation typing symbols.
     command_handlers = "\n\n".join(
         dedent(
             inspect.getsource(command.cli).replace("cli(self, ", f"{command.name}(", 1)
         )
         for command in commands
-    )
+    ).replace("@override\n", "")
 
     # parse commands
     command_parsers: list[str] = []

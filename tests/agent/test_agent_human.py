@@ -13,6 +13,7 @@ from io import StringIO
 from pathlib import Path
 from typing import Callable, Literal, NamedTuple, overload
 from uuid import uuid4
+from typing import override
 
 import pytest
 from test_helpers.local_shell_sandbox import LocalShellSandbox
@@ -55,6 +56,27 @@ from inspect_ai.util._sandbox.environment import (
 )
 from inspect_ai.util._sandbox.local import LocalSandboxEnvironment
 from inspect_ai.util._subprocess import ExecResult
+
+
+class _OverrideCommand(HumanAgentCommand):
+    @property
+    def name(self) -> str:
+        return "override"
+
+    @property
+    def description(self) -> str:
+        return "A command whose handler uses a type-only decorator."
+
+    @override
+    def cli(self, args: Namespace) -> None:
+        del args
+
+
+def test_generated_human_agent_commands_strip_type_only_override() -> None:
+    task_py = human_agent_commands([_OverrideCommand()])
+
+    assert "@override" not in task_py
+    compile(task_py, "task.py", "exec")
 
 
 @pytest.mark.parametrize(
