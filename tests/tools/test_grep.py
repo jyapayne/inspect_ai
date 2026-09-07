@@ -1,5 +1,7 @@
 """Tests for grep tool."""
 
+from pathlib import Path
+
 import pytest
 from test_helpers.tool_call_utils import get_tool_call, get_tool_response
 from test_helpers.utils import skip_if_no_docker
@@ -9,12 +11,24 @@ from inspect_ai.dataset import Sample
 from inspect_ai.model import ModelOutput, get_model
 from inspect_ai.scorer import includes
 from inspect_ai.solver import generate, use_tools
-from inspect_ai.tool import grep
+from inspect_ai.tool import Tool, grep
+from inspect_ai.util import SandboxEnvironmentType
 
 TEST_FILES = {
     "/tmp/testdir/hello.py": "def hello():\n    print('hello world')\n",
     "/tmp/testdir/goodbye.txt": "goodbye world\nfarewell\n",
     "/tmp/testdir/data.csv": "name,value\nalpha,1\nbeta,2\n",
+}
+
+TOOL_SANDBOX: SandboxEnvironmentType = (
+    "docker",
+    str(Path(__file__).with_name("test_sandbox_compose.yaml")),
+)
+
+CWD_TEST_FILES = {
+    "provider-default.txt": "provider-default-grep",
+    "/tmp/cwd-bound/inside.txt": "configured-cwd-grep",
+    "/tmp/outside/outside.txt": "absolute-path-grep",
 }
 
 
@@ -24,24 +38,35 @@ def test_grep_constructible() -> None:
     assert tool is not None
 
 
-def _grep_task() -> Task:
+def _grep_task(
+    *,
+    tool: Tool | None = None,
+    files: dict[str, str] | None = None,
+    sandbox: SandboxEnvironmentType = "docker",
+) -> Task:
     return Task(
         dataset=[
             Sample(
                 input="Please use the tool",
                 target="n/a",
-                files=TEST_FILES,
+                files=files or TEST_FILES,
             )
         ],
-        solver=[use_tools(grep()), generate()],
+        solver=[use_tools(tool if tool is not None else grep()), generate()],
         scorer=includes(),
         message_limit=3,
-        sandbox="docker",
+        sandbox=sandbox,
     )
 
 
-def _run_grep(tool_arguments: dict) -> str:
-    task = _grep_task()
+def _run_grep(
+    tool_arguments: dict,
+    *,
+    tool: Tool | None = None,
+    files: dict[str, str] | None = None,
+    sandbox: SandboxEnvironmentType = "docker",
+) -> str:
+    task = _grep_task(tool=tool, files=files, sandbox=sandbox)
     result = eval(
         task,
         model=get_model(
@@ -175,3 +200,37 @@ def test_grep_count_mode() -> None:
     )
     # Should show counts, not full lines
     assert ":" in content
+
+
+@skip_if_no_docker
+@pytest.mark.slow
+def test_grep_cwd_uses_configured_directory_and_keeps_absolute_paths() -> None:
+    configured_tool = grep(cwd="/tmp/cwd-bound")
+
+    relative_content = _run_grep(
+        {"pattern": "configured-cwd-grep"},
+        tool=configured_tool,
+        files=CWD_TEST_FILES,
+        sandbox=TOOL_SANDBOX,
+    )
+    absolute_content = _run_grep(
+        {"pattern": "absolute-path-grep", "path": "/tmp/outside"},
+        tool=configured_tool,
+        files=CWD_TEST_FILES,
+        sandbox=TOOL_SANDBOX,
+    )
+
+    assert "configured-cwd-grep" in relative_content
+    assert "absolute-path-grep" in absolute_content
+
+
+@skip_if_no_docker
+@pytest.mark.slow
+def test_grep_omitted_cwd_keeps_provider_default_directory() -> None:
+    content = _run_grep(
+        {"pattern": "provider-default-grep"},
+        files=CWD_TEST_FILES,
+        sandbox=TOOL_SANDBOX,
+    )
+
+    assert "provider-default-grep" in content
