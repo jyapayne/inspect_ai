@@ -228,6 +228,7 @@
 - Scoring: Support tuples and non-list sequences in Target. (#5039)
 - Analysis: Fixed `task_info()` and `log_viewer()` raising `ValueError` when applied to an empty DataFrame. (#4826)
 - Eval Set: `eval_set()` now defaults `log_dir` to `INSPECT_LOG_DIR` or `./logs`, as `eval()` does, rather than requiring it.
+- OpenAI: Sandboxed agents now receive exhausted provider errors with their original status and error details.
 - Eval Set: An external runner driving `eval_set()` can now override any argument that does not change task identity, rather than only five.
 - Eval Set: An eval set driven by an external runner now honors the `INSPECT_EVAL_*` environment variables with the same meanings `inspect eval-set` gives them.
 - Eval Set: Eval set selections now support specifying scanners.
