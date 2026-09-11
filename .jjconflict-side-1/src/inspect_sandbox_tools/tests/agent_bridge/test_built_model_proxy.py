@@ -104,41 +104,47 @@ def _listening(port: int) -> bool:
         return probe.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _stop(proxy: subprocess.Popen[str]) -> None:
+    proxy.terminate()
+    try:
+        proxy.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proxy.kill()
+        proxy.wait()
+
+
 @pytest.fixture(scope="module")
 def built_model_proxy(built_sandbox_tools: Path) -> Iterator[BuiltModelProxy]:
     host = StubBridgeHost(instance=f"test-{uuid.uuid4().hex}")
     host.start()
-    port = _free_port()
-    proxy = subprocess.Popen(
-        [str(built_sandbox_tools), "model_proxy"],
-        env={
-            **os.environ,
-            "BRIDGE_MODEL_SERVICE_PORT": str(port),
-            "BRIDGE_MODEL_SERVICE_INSTANCE": host.requests.parent.name,
-        },
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-    )
-    base_url = f"http://127.0.0.1:{port}"
     try:
-        deadline = time.monotonic() + 30
-        while not _listening(port):
-            if proxy.poll() is not None:
-                output = proxy.stdout.read() if proxy.stdout else ""
-                raise RuntimeError(
-                    f"built model_proxy exited {proxy.returncode} before serving:\n{output}"
-                )
-            if time.monotonic() > deadline:
-                raise TimeoutError(f"built model_proxy never listened on {port}")
-            time.sleep(0.1)
-        yield BuiltModelProxy(base_url, host)
-    finally:
-        proxy.terminate()
+        port = _free_port()
+        proxy = subprocess.Popen(
+            [str(built_sandbox_tools), "model_proxy"],
+            env={
+                **os.environ,
+                "BRIDGE_MODEL_SERVICE_PORT": str(port),
+                "BRIDGE_MODEL_SERVICE_INSTANCE": host.requests.parent.name,
+            },
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
         try:
-            proxy.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proxy.kill()
+            deadline = time.monotonic() + 30
+            while not _listening(port):
+                if proxy.poll() is not None:
+                    output = proxy.stdout.read() if proxy.stdout else ""
+                    raise RuntimeError(
+                        f"built model_proxy exited {proxy.returncode} before serving:\n{output}"
+                    )
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"built model_proxy never listened on {port}")
+                time.sleep(0.1)
+            yield BuiltModelProxy(f"http://127.0.0.1:{port}", host)
+        finally:
+            _stop(proxy)
+    finally:
         host.stop()
 
 
