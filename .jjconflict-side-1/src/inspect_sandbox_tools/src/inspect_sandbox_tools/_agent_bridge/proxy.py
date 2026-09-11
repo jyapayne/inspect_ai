@@ -623,11 +623,22 @@ _ANTHROPIC_ERROR_TYPES = {
 
 
 def _anthropic_error_body(status: int, message: str) -> dict[str, Any]:
-    """Anthropic-dialect error body."""
+    """Anthropic-dialect error body.
+
+    An unlisted 4xx keeps a CLIENT classification rather than degrading to
+    `api_error`: the SDK recognizes statuses the table does not name (422 ->
+    `UnprocessableEntityError`), and Anthropic's error documentation permits
+    `invalid_request_error` for other 4xx responses. Calling a client error a
+    server error is the same defect the table above exists to prevent, one
+    status further out.
+    """
+    kind = _ANTHROPIC_ERROR_TYPES.get(status)
+    if kind is None:
+        kind = "invalid_request_error" if 400 <= status < 500 else "api_error"
     return {
         "type": "error",
         "error": {
-            "type": _ANTHROPIC_ERROR_TYPES.get(status, "api_error"),
+            "type": kind,
             "message": message,
         },
     }

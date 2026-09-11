@@ -7,7 +7,7 @@ from typing import Any, AsyncGenerator, AsyncIterator
 
 import pytest
 from aiohttp import ClientSession
-from anthropic import AsyncAnthropic
+from anthropic import APIStatusError, AsyncAnthropic
 from anthropic.types import ToolParam
 from google import genai
 from inspect_sandbox_tools._agent_bridge.proxy import (
@@ -20,6 +20,8 @@ from openai.types.responses import (
     FunctionToolParam,
     ResponseOutputText,
 )
+
+from tests.conftest import ANTHROPIC_WIRE_ERROR_TYPES
 
 
 @pytest.fixture
@@ -3128,3 +3130,41 @@ async def test_relayed_upstream_response_has_no_cross_origin_headers(
             assert response.status == 200
             assert await response.read() == upstream_body
             _assert_no_cross_origin_headers(response.headers)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("status", "expected_type"), ANTHROPIC_WIRE_ERROR_TYPES)
+@pytest.mark.parametrize("stream", [False, True], ids=["non-streaming", "streaming"])
+async def test_anthropic_sdk_observes_the_providers_error_type(
+    status: int, expected_type: str, stream: bool
+) -> None:
+    """A real Anthropic SDK client reads the provider's own error classification.
+
+    The proxy serializes the error body itself, so the host-side tests cannot see
+    what a client is told. Non-streaming clients also see the HTTP status; a
+    streaming client has already received a 200 and `message_start`, so the SSE
+    `error` event's `type` is the only classification it gets -- an `api_error`
+    there turns a conflict or a deadline into a server failure.
+    """
+    message = f"provider said {status}"
+    async with _proxy_with_service(_error_service(status, message)) as base_url:
+        client = AsyncAnthropic(api_key="test", base_url=base_url, max_retries=0)
+        request: dict[str, Any] = {
+            "model": "claude-x",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        with pytest.raises(APIStatusError) as exc_info:
+            if stream:
+                async with client.messages.stream(**request) as events:
+                    async for _ in events:
+                        pass
+            else:
+                await client.messages.create(**request)
+
+    body = exc_info.value.body
+    assert isinstance(body, dict)
+    assert body["error"]["type"] == expected_type
+    assert body["error"]["message"] == message
+    if not stream:
+        assert exc_info.value.status_code == status
