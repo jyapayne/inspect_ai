@@ -1,8 +1,8 @@
 ## Unreleased
 
 - Bugfix: `inspect score --scorer pkg/name` now resolves `@scanner` functions from installed packages (e.g. `inspect_petri/audit_judge`) instead of failing with `LookupError`; unknown names now report the "scorer couldn't be loaded" guidance rather than a raw traceback.
-- Anthropic: Forcing the `web_search` tool via `tool_choice` on Claude 4.6+ models no longer fails with a 400 (`allowed_callers`); Claude Code's WebSearch works through the agent bridge again, and `allowed_callers` can be set explicitly.
-- Agent Bridge: A provider error delivered mid-stream (SSE `error` event on a 200 response) now reaches the bridged agent with the provider's real status instead of HTTP 200.
+- Anthropic: Forced web searches (`tool_choice` naming `web_search`) now work on Claude 4.6+ models, including Claude Code's WebSearch through the agent bridge; `allowed_callers` can be set explicitly.
+- Agent Bridge: A provider error delivered during a streamed response now reaches the bridged agent as an error instead of a malformed HTTP 200 success.
 
 ## 0.3.265 (17 September 2026)
 

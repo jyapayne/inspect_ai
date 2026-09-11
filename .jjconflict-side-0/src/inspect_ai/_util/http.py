@@ -18,12 +18,10 @@ def status_code_of(ex: BaseException) -> int | None:
     `code` (google-genai `APIError`). Returns None when no integer status is
     found.
 
-    A 2xx status on an exception is not the error's status: it is the status of
-    a streaming response whose body then carried an `error` event (the Anthropic
-    SDK raises `APIStatusError` with `status_code` of the 200 stream in that
-    case). The status is then taken from the error body's `type` instead, so
-    retry classification and forwarded errors see the provider's 4xx/5xx rather
-    than a success code.
+    A 2xx response status does not describe a failure (the Anthropic SDK raises
+    `APIStatusError` with the 200 stream's status for an SSE `error` event).
+    Recover a status from a structured error body when possible; otherwise
+    return None.
     """
     for attr in ("status_code", "code"):
         value = getattr(ex, attr, None)
@@ -41,24 +39,28 @@ _ANTHROPIC_ERROR_TYPE_STATUS = {
     "billing_error": 402,
     "permission_error": 403,
     "not_found_error": 404,
+    "conflict_error": 409,
     "request_too_large": 413,
     "rate_limit_error": 429,
-    "timeout_error": 408,
     "api_error": 500,
+    "timeout_error": 504,
     "overloaded_error": 529,
 }
 
 
 def _status_from_error_body(body: object) -> int | None:
-    """Status implied by a provider error body, for errors delivered on a 2xx stream."""
+    """Status implied by a provider error body, for errors delivered on a 2xx response."""
     if not isinstance(body, dict):
         return None
     error = body.get("error", body)
     if not isinstance(error, dict):
         return None
-    status = error.get("status", error.get("code"))
-    if isinstance(status, int) and not (200 <= status < 300):
-        return status
+    # Google bodies carry a symbolic `status` ("UNAVAILABLE") beside a numeric `code`;
+    # take the first usable integer rather than whichever key happens to be present.
+    for key in ("status", "code"):
+        value = error.get(key)
+        if isinstance(value, int) and not (200 <= value < 300):
+            return value
     error_type = error.get("type")
     if isinstance(error_type, str):
         return _ANTHROPIC_ERROR_TYPE_STATUS.get(error_type)

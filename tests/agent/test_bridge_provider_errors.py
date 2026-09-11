@@ -80,7 +80,9 @@ class _StreamError(Exception):
     ("error_type", "expected"),
     [
         ("invalid_request_error", 400),
+        ("conflict_error", 409),
         ("rate_limit_error", 429),
+        ("timeout_error", 504),
         ("overloaded_error", 529),
     ],
 )
@@ -93,6 +95,9 @@ def test_status_code_of_derives_mid_stream_status_from_error_type(
 
 def test_status_code_of_prefers_numeric_status_in_error_body() -> None:
     ex = _StreamError({"error": {"code": 503, "message": "unavailable"}})
+    assert status_code_of(ex) == 503
+    # Google shape: symbolic `status` beside the numeric `code`.
+    ex = _StreamError({"error": {"status": "UNAVAILABLE", "code": 503, "message": "x"}})
     assert status_code_of(ex) == 503
 
 
