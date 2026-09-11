@@ -601,14 +601,23 @@ def _openai_error_body(status: int, message: str) -> dict[str, Any]:
     }
 
 
+# The inverse of `status_code_of`: every status that helper can derive from a
+# provider error body must map back to its Anthropic error type here. A status
+# missing from this table degrades to `api_error`, and on the STREAMING route
+# that error type is the only machine-readable signal the client gets -- the
+# HTTP status is already 200 by the time the error is known -- so a missing
+# entry silently reclassifies a client error as a server error.
 _ANTHROPIC_ERROR_TYPES = {
     400: "invalid_request_error",
     401: "authentication_error",
+    402: "billing_error",
     403: "permission_error",
     404: "not_found_error",
+    409: "conflict_error",
     413: "request_too_large",
     429: "rate_limit_error",
     500: "api_error",
+    504: "timeout_error",
     529: "overloaded_error",
 }
 
