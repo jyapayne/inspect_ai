@@ -1,7 +1,6 @@
 from pathlib import Path
 from typing import Final
 
-
 # release/2026-07-26 carried version 24. The value is intentionally independent
 # of the sandbox-tools package semver, which can remain unchanged across rebuilds.
 PREVIOUS_DATED_RELEASE_SANDBOX_TOOLS_VERSION: Final = 24
