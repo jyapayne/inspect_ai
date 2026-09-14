@@ -1818,10 +1818,11 @@ class AnthropicAPI(ModelAPI):
     @override
     def should_retry(self, ex: BaseException) -> bool | RetryDecision:
         if isinstance(ex, APIStatusError):
+            # A mid-stream SSE error event reaches here with the stream's 200
+            # status; give it its effective status first (a no-op once
+            # generate() has done so) so the status rules below classify it.
+            _normalize_stream_error(ex)
             retry_after = parse_retry_after_from_exception(ex)
-            # Mid-stream errors have already been normalized to their effective
-            # HTTP status by generate(), so standard status classification below
-            # covers them as well as ordinary HTTP responses.
             if isinstance(ex.body, dict | str):
                 # message-based fallback for error bodies without a
                 # recognized type (a mid-stream error event whose data fails
