@@ -301,10 +301,14 @@ async def test_forward_provider_errors_signals_refusal_to_bridge(
         ("timeout_error", 504),
     ],
 )
-async def test_bridge_forwards_retry_exhausted_anthropic_stream_error(
+async def test_bridge_forwards_retry_exhausted_anthropic_http_error(
     monkeypatch: pytest.MonkeyPatch, error_type: str, status: int
 ) -> None:
-    """Retry exhaustion must preserve the streamed provider error for the client."""
+    """Retry exhaustion preserves streaming HTTP errors for the bridge client.
+
+    The 200-SSE status normalization is covered when this member composes with
+    the Anthropic provider member; this test covers the RetryError unwrap here.
+    """
     message = f"provider said {status}"
     model = get_model(
         "anthropic/claude-test",
@@ -337,7 +341,10 @@ async def test_bridge_forwards_retry_exhausted_anthropic_stream_error(
     )
 
     async def generate_anthropic(
-        _json_data: dict[str, JsonValue],
+        json_data: dict[str, JsonValue],
+        headers: dict[str, str] | None = None,
+        *,
+        metadata_headers: dict[str, str] | None = None,
     ) -> dict[str, JsonValue]:
         await model.generate(input="hello")
         raise AssertionError("model generation unexpectedly succeeded")
