@@ -9,14 +9,13 @@ extractors, and the `service.py` wrapper that turns an exception into a
 
 from __future__ import annotations
 
-import ast
-from pathlib import Path
 from typing import Any
 
+import httpx2
 import pytest
+from anthropic import APIStatusError
 
-import inspect_ai
-from inspect_ai._util.http import _ANTHROPIC_ERROR_TYPE_STATUS, status_code_of
+from inspect_ai._util.http import status_code_of
 from inspect_ai._util.registry import _registry
 from inspect_ai.agent._agent import AgentState
 from inspect_ai.agent._bridge._errors import (
@@ -26,8 +25,9 @@ from inspect_ai.agent._bridge._errors import (
 from inspect_ai.agent._bridge.sandbox import service as bridge_service
 from inspect_ai.agent._bridge.sandbox.service import _forward_provider_errors
 from inspect_ai.agent._bridge.sandbox.types import SandboxAgentBridge
-from inspect_ai.model import GenerateConfig, ModelOutput, get_model
+from inspect_ai.model import ChatMessageUser, GenerateConfig, ModelOutput, get_model
 from inspect_ai.model._model import ModelAPI, ModelGenerateError, ModelRefusalError
+from inspect_ai.model._providers.anthropic import AnthropicAPI
 from inspect_ai.model._registry import modelapi
 from inspect_ai.util._limit import LimitExceededError
 
@@ -66,124 +66,63 @@ def test_status_code_of_returns_none_when_absent() -> None:
     assert status_code_of(_ProviderError("x", 0)) == 0  # falsy-but-valid status
 
 
-class _StreamError(Exception):
-    """Stand-in for an SDK error raised for an SSE `error` event on a 200 stream.
+def _anthropic_stream_error(error_type: str, message: str) -> APIStatusError:
+    """Build the SDK's generic exception for an SSE error event."""
+    return APIStatusError(
+        message,
+        response=httpx2.Response(
+            status_code=200,
+            request=httpx2.Request("POST", "https://api.anthropic.com/v1/messages"),
+        ),
+        body={"type": "error", "error": {"type": error_type, "message": message}},
+    )
 
-    The Anthropic SDK builds `APIStatusError` from the stream's own response, so
-    `status_code` is 200 and the real status is only implied by `body`.
-    """
 
-    def __init__(self, body: object, status_code: int = 200) -> None:
-        super().__init__("mid-stream error")
-        self.status_code = status_code
-        self.body = body
+def test_status_code_of_preserves_declared_stream_response_status() -> None:
+    """Generic HTTP extraction must not interpret provider-specific error bodies."""
+    assert (
+        status_code_of(
+            _anthropic_stream_error("invalid_request_error", "provider said 400")
+        )
+        == 200
+    )
 
 
+@pytest.mark.anyio
 @pytest.mark.parametrize(
-    ("error_type", "expected"),
+    ("error_type", "status", "retry"),
     [
-        ("invalid_request_error", 400),
-        ("conflict_error", 409),
-        ("rate_limit_error", 429),
-        ("timeout_error", 504),
-        ("overloaded_error", 529),
+        ("invalid_request_error", 400, False),
+        ("billing_error", 402, False),
+        ("conflict_error", 409, False),
+        ("rate_limit_error", 429, True),
+        ("timeout_error", 504, True),
+        ("overloaded_error", 529, True),
     ],
 )
-def test_status_code_of_derives_mid_stream_status_from_error_type(
-    error_type: str, expected: int
+async def test_anthropic_stream_error_is_normalized_for_retry(
+    monkeypatch: pytest.MonkeyPatch, error_type: str, status: int, retry: bool
 ) -> None:
-    ex = _StreamError({"type": "error", "error": {"type": error_type, "message": "x"}})
-    assert status_code_of(ex) == expected
+    """SSE errors must use their actual status before retry classification."""
+    message = f"provider said {status}"
+    api = AnthropicAPI(model_name="claude-test", api_key="test-key")
 
+    async def fail_request(*args: object, **kwargs: object) -> object:
+        raise _anthropic_stream_error(error_type, message)
 
-def test_status_code_of_prefers_numeric_status_in_error_body() -> None:
-    ex = _StreamError({"error": {"code": 503, "message": "unavailable"}})
-    assert status_code_of(ex) == 503
-    # Google shape: symbolic `status` beside the numeric `code`.
-    ex = _StreamError({"error": {"status": "UNAVAILABLE", "code": 503, "message": "x"}})
-    assert status_code_of(ex) == 503
+    monkeypatch.setattr(api, "_perform_request_and_continuations", fail_request)
 
-
-def test_status_code_of_mid_stream_without_usable_body_is_none() -> None:
-    # Never report a success code for an exception; None lets the proxy apply
-    # its default error status instead of a 200.
-    assert status_code_of(_StreamError(None)) is None
-    assert status_code_of(_StreamError({"error": {"type": "unknown_error"}})) is None
-
-
-def _dict_literal(source: Path, name: str) -> dict[int, str]:
-    """The `{int: str}` literal assigned to `name` at module level in `source`.
-
-    Parsed rather than imported because the module lives in a sibling
-    distribution this test environment does not install.
-    """
-    tree = ast.parse(source.read_text(encoding="utf-8"))
-    for node in tree.body:
-        if not isinstance(node, ast.Assign):
-            continue
-        targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
-        if name in targets:
-            literal = ast.literal_eval(node.value)
-            assert isinstance(literal, dict), f"{name} in {source} is not a dict"
-            return {int(status): str(kind) for status, kind in literal.items()}
-    raise AssertionError(
-        f"{name} not found in {source}; the table was renamed or moved"
-    )
-
-
-def test_every_recognized_error_type_survives_the_proxy_round_trip() -> None:
-    """An error type the host can read must come back out of the proxy unchanged.
-
-    `status_code_of` turns a mid-stream provider error body into an HTTP status,
-    and the proxy turns that status back into an Anthropic error body. On the
-    streaming route the status is already 200 by the time the error is known, so
-    the error `type` in that body is the client's only machine-readable signal:
-    a type the host recognizes but the proxy cannot invert degrades to
-    `api_error`, reclassifying a client error (a 409 conflict) as a server one.
-
-    The proxy ships in `inspect_sandbox_tools`, a separate distribution that
-    deliberately does not depend on `inspect_ai`, so neither side can import the
-    other's table. Reading its literal is therefore the only way to hold the two
-    halves together in one assertion, and it is worth holding: iterating the
-    host's own table means the next status added there fails here until the
-    proxy learns it.
-    """
-    proxy_source = (
-        Path(inspect_ai.__file__).parents[1]
-        / "inspect_sandbox_tools"
-        / "src"
-        / "inspect_sandbox_tools"
-        / "_agent_bridge"
-        / "proxy.py"
-    )
-    assert proxy_source.is_file(), f"proxy source not found at {proxy_source}"
-    proxy_types = _dict_literal(proxy_source, "_ANTHROPIC_ERROR_TYPES")
-
-    lost: dict[str, str] = {}
-    for error_type, status in _ANTHROPIC_ERROR_TYPE_STATUS.items():
-        ex = _StreamError(
-            {"type": "error", "error": {"type": error_type, "message": "x"}}
+    with pytest.raises(APIStatusError) as exc_info:
+        await api.generate(
+            input=[ChatMessageUser(content="hello")],
+            tools=[],
+            tool_choice="auto",
+            config=GenerateConfig(max_tokens=8),
         )
-        derived = status_code_of(ex)
-        assert derived == status, f"{error_type} derived {derived}, expected {status}"
-        returned = proxy_types.get(derived, "api_error")
-        if returned != error_type:
-            lost[error_type] = returned
 
-    # No permitted losses. An earlier revision excepted `billing_error` on the
-    # reasoning that the bridge never bills -- but the bridge forwards the
-    # PROVIDER's errors, and a provider can refuse the caller's account for
-    # billing, so excepting it would have shipped a reachable 402 reclassified as
-    # a server failure and called that expected.
-    assert lost == {}, (
-        "these error types do not survive the round trip through the proxy, so a "
-        f"streaming client sees the wrong classification: {lost}"
-    )
-
-
-def test_provider_error_payload_mid_stream_error_is_not_200() -> None:
-    ex = _StreamError({"type": "error", "error": {"type": "invalid_request_error"}})
-    assert provider_error_payload(ex)["status"] == 400
+    assert exc_info.value.status_code == status
+    assert exc_info.value.message == message
+    assert bool(api.should_retry(exc_info.value)) is retry
 
 
 # ---------- ModelGenerateError ----------

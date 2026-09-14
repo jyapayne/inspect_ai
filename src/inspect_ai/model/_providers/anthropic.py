@@ -893,10 +893,11 @@ class AnthropicAPI(ModelAPI):
                     request, streaming, tools, config
                 )
             except (BadRequestError, APIStatusError) as ex:
+                _normalize_stream_error(ex)
                 model_call.set_error(
                     as_error_response(ex.body), self._http_hooks.end_request(request_id)
                 )
-                raise ex
+                raise
 
             model_call.set_response(response, self._http_hooks.end_request(request_id))
 
@@ -1818,20 +1819,9 @@ class AnthropicAPI(ModelAPI):
     def should_retry(self, ex: BaseException) -> bool | RetryDecision:
         if isinstance(ex, APIStatusError):
             retry_after = parse_retry_after_from_exception(ex)
-            # An error event delivered mid-stream surfaces as an
-            # APIStatusError with status_code == 200 (the SDK builds it from
-            # the SSE error body, not an HTTP status), so the status-based
-            # checks below can't classify it — classify from the body's
-            # error type: these are the in-band analogues of 429/529/500/408.
-            # Scoped to status 200 so that a real HTTP error status (e.g. a
-            # proxy's 4xx wrapping an anthropic-format body) keeps failing
-            # fast via the status rules.
-            if ex.status_code == 200 and isinstance(ex.body, dict):
-                error_type = _error_type_from_body(ex.body)
-                if error_type == "rate_limit_error":
-                    return RetryDecision.rate_limit(retry_after=retry_after)
-                if error_type in ("overloaded_error", "api_error", "timeout_error"):
-                    return RetryDecision.transient(retry_after=retry_after)
+            # Mid-stream errors have already been normalized to their effective
+            # HTTP status by generate(), so standard status classification below
+            # covers them as well as ordinary HTTP responses.
             if isinstance(ex.body, dict | str):
                 # message-based fallback for error bodies without a
                 # recognized type (a mid-stream error event whose data fails
@@ -5051,18 +5041,40 @@ def _warn_refusal_without_fallback(
     )
 
 
-def _error_type_from_body(body: dict[str, Any]) -> str | None:
-    """Extract the API error type from an error response body.
+_ANTHROPIC_ERROR_TYPE_STATUS = {
+    "invalid_request_error": 400,
+    "authentication_error": 401,
+    "billing_error": 402,
+    "permission_error": 403,
+    "not_found_error": 404,
+    "conflict_error": 409,
+    "request_too_large": 413,
+    "rate_limit_error": 429,
+    "api_error": 500,
+    "timeout_error": 504,
+    "overloaded_error": 529,
+}
 
-    The SDK attaches the full error envelope as `ex.body` — for both
-    mid-stream SSE error events and non-streaming HTTP errors —
-    ({"type": "error", "error": {"type": "rate_limit_error", ...}}).
-    """
-    error = body.get("error")
-    if isinstance(error, dict):
-        error_type = error.get("type")
-        return error_type if isinstance(error_type, str) else None
-    return None
+
+def _normalize_stream_error(ex: APIStatusError) -> None:
+    """Normalize a 200 SSE error event to its provider-defined HTTP status."""
+    if ex.status_code != 200 or not isinstance(ex.body, dict):
+        return
+    error = ex.body.get("error")
+    if not isinstance(error, dict):
+        return
+    error_type = error.get("type")
+    if not isinstance(error_type, str):
+        return
+    status = _ANTHROPIC_ERROR_TYPE_STATUS.get(error_type)
+    if status is None:
+        return
+    message = error.get("message")
+    if isinstance(message, str):
+        ex.message = message
+        ex.args = (message,)
+    ex.status_code = status
+    ex.response.status_code = status
 
 
 def _strip_reasoning(message: ChatMessageAssistant) -> ChatMessageAssistant:
