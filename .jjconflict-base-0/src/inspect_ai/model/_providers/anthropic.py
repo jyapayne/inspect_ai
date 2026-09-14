@@ -1823,6 +1823,11 @@ class AnthropicAPI(ModelAPI):
             # generate() has done so) so the status rules below classify it.
             _normalize_stream_error(ex)
             retry_after = parse_retry_after_from_exception(ex)
+            if ex.status_code == 429:
+                # The provider's own classification outranks any message text:
+                # a rate_limit_error whose message mentions overload is still a
+                # rate limit, and only that kind feeds adaptive concurrency.
+                return RetryDecision.rate_limit(retry_after=retry_after)
             if isinstance(ex.body, dict | str):
                 # message-based fallback for error bodies without a
                 # recognized type (a mid-stream error event whose data fails
@@ -5058,18 +5063,29 @@ _ANTHROPIC_ERROR_TYPE_STATUS = {
 
 
 def _normalize_stream_error(ex: APIStatusError) -> None:
-    """Normalize a 200 SSE error event to its provider-defined HTTP status."""
+    """Give a mid-stream SSE error event its effective HTTP status and message.
+
+    The SDK raises `APIStatusError` for an SSE `error` event with the stream's
+    own status (200) and the error envelope as `body`; the real status is only
+    implied by the envelope's `type`. Rewrite the exception in place so every
+    downstream reader -- retry classification, bad-request handling, the agent
+    bridge -- sees the status the provider meant. An envelope whose type this
+    table does not name is still an error the provider reported, never a
+    success, so it becomes a 500 rather than escaping as a 200 that a client
+    would read as a (malformed) reply. A no-op on an ordinary HTTP error or an
+    already-normalized exception.
+    """
     if ex.status_code != 200 or not isinstance(ex.body, dict):
         return
     error = ex.body.get("error")
     if not isinstance(error, dict):
         return
     error_type = error.get("type")
-    if not isinstance(error_type, str):
-        return
-    status = _ANTHROPIC_ERROR_TYPE_STATUS.get(error_type)
-    if status is None:
-        return
+    status = (
+        _ANTHROPIC_ERROR_TYPE_STATUS.get(error_type, 500)
+        if isinstance(error_type, str)
+        else 500
+    )
     message = error.get("message")
     if isinstance(message, str):
         ex.message = message

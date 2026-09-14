@@ -191,6 +191,43 @@ def test_every_recognized_error_type_survives_the_proxy_round_trip() -> None:
         f"streaming client sees the wrong classification: {lost}"
     )
 
+    # And the other direction: a status the proxy can name must be one the
+    # provider derives, or the proxy carries a classification nothing produces
+    # and a type dropped from the provider table goes unnoticed above.
+    unproduced = {
+        status: kind
+        for status, kind in proxy_types.items()
+        if kind not in _ANTHROPIC_ERROR_TYPE_STATUS
+        or _ANTHROPIC_ERROR_TYPE_STATUS[kind] != status
+    }
+    assert unproduced == {}, (
+        "the proxy names these statuses but the provider table does not derive "
+        f"them, so the two tables have drifted: {unproduced}"
+    )
+
+
+def test_unknown_stream_error_type_is_a_server_error_not_a_success() -> None:
+    # An SSE error event whose type this provider does not know is still an
+    # error the provider reported. It must not keep the stream's 200: the bridge
+    # would forward it as a success and a client would read the envelope as a
+    # (malformed) reply instead of raising.
+    ex = _anthropic_stream_error("some_future_error", "provider said no")
+    _normalize_stream_error(ex)
+    assert ex.status_code == 500
+    assert ex.message == "provider said no"
+    assert provider_error_payload(ex)["status"] == 500
+
+
+def test_stream_rate_limit_outranks_an_overloaded_message() -> None:
+    # The provider's own classification wins over message text: a
+    # rate_limit_error whose message mentions overload is a rate limit, the
+    # one kind adaptive concurrency acts on, not a generic transient failure.
+    api = AnthropicAPI(model_name="claude-test", api_key="test-key")
+    ex = _anthropic_stream_error("rate_limit_error", "overloaded, slow down")
+    decision = api.should_retry(ex)
+    assert not isinstance(decision, bool)
+    assert decision.kind == "rate_limit"
+
 
 # ---------- ModelGenerateError ----------
 
