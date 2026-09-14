@@ -11,7 +11,10 @@ from __future__ import annotations
 
 from typing import Any
 
+import httpx2
 import pytest
+from anthropic import APIStatusError
+from pydantic import JsonValue
 
 from inspect_ai._util.http import status_code_of
 from inspect_ai._util.registry import _registry
@@ -25,6 +28,7 @@ from inspect_ai.agent._bridge.sandbox.service import _forward_provider_errors
 from inspect_ai.agent._bridge.sandbox.types import SandboxAgentBridge
 from inspect_ai.model import GenerateConfig, ModelOutput, get_model
 from inspect_ai.model._model import ModelAPI, ModelGenerateError, ModelRefusalError
+from inspect_ai.model._providers.anthropic import AnthropicAPI
 from inspect_ai.model._registry import modelapi
 from inspect_ai.util._limit import LimitExceededError
 
@@ -286,6 +290,62 @@ async def test_forward_provider_errors_signals_refusal_to_bridge(
     assert bridge._failure_requested.is_set()
     assert bridge._failure is refusal
     assert warnings == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("error_type", "status"),
+    [
+        ("rate_limit_error", 429),
+        ("overloaded_error", 529),
+        ("timeout_error", 504),
+    ],
+)
+async def test_bridge_forwards_retry_exhausted_anthropic_stream_error(
+    monkeypatch: pytest.MonkeyPatch, error_type: str, status: int
+) -> None:
+    """Retry exhaustion must preserve the streamed provider error for the client."""
+    message = f"provider said {status}"
+    model = get_model(
+        "anthropic/claude-test",
+        api_key="test-key",
+        config=GenerateConfig(max_retries=1),
+        memoize=False,
+    )
+    assert isinstance(model.api, AnthropicAPI)
+    model.api.streaming = True
+    attempts = 0
+
+    async def fail_stream_request(*args: object, **kwargs: object) -> object:
+        nonlocal attempts
+        assert args[1] is True
+        attempts += 1
+        raise APIStatusError(
+            message,
+            response=httpx2.Response(
+                status_code=status,
+                request=httpx2.Request("POST", "https://api.anthropic.com/v1/messages"),
+            ),
+            body={
+                "type": "error",
+                "error": {"type": error_type, "message": message},
+            },
+        )
+
+    monkeypatch.setattr(
+        model.api, "_perform_request_and_continuations", fail_stream_request
+    )
+
+    async def generate_anthropic(
+        _json_data: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        await model.generate(input="hello")
+        raise AssertionError("model generation unexpectedly succeeded")
+
+    result = await _forward_provider_errors(generate_anthropic)({})
+
+    assert attempts == 2
+    assert result == {PROVIDER_ERROR_KEY: {"status": status, "message": message}}
 
 
 # ---------- _model.py wrap path (end to end) ----------
