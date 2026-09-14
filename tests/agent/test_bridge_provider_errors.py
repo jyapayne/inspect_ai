@@ -218,6 +218,37 @@ def test_unknown_stream_error_type_is_a_server_error_not_a_success() -> None:
     assert provider_error_payload(ex)["status"] == 500
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param("event: error\ndata: not json", id="undecodable-string"),
+        pytest.param(
+            {"type": "error", "error": "overloaded"}, id="error-not-a-mapping"
+        ),
+        pytest.param({"type": "error"}, id="no-error-member"),
+        pytest.param(None, id="no-body"),
+    ],
+)
+def test_malformed_stream_error_is_a_server_error_not_a_success(
+    body: object,
+) -> None:
+    # The SDK raised, so the provider failed the request; whatever shape the
+    # event data took, a 200 must not survive normalization. The body stays as
+    # captured so the operator can still see what the provider sent.
+    ex = APIStatusError(
+        "mid-stream error",
+        response=httpx2.Response(
+            status_code=200,
+            request=httpx2.Request("POST", "https://api.anthropic.com/v1/messages"),
+        ),
+        body=body,
+    )
+    _normalize_stream_error(ex)
+    assert ex.status_code == 500
+    assert ex.body == body
+    assert provider_error_payload(ex)["status"] == 500
+
+
 def test_stream_rate_limit_outranks_an_overloaded_message() -> None:
     # The provider's own classification wins over message text: a
     # rate_limit_error whose message mentions overload is a rate limit, the
