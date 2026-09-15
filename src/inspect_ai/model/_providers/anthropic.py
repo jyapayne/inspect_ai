@@ -1844,11 +1844,16 @@ class AnthropicAPI(ModelAPI):
                 ):
                     return RetryDecision.transient(retry_after=retry_after)
 
-            # standard http status code checking
+            if _is_unclassified_stream_error(ex):
+                # a mid-stream error this provider could not classify carries
+                # a 500 only so the failure is reported as one; nothing says
+                # it is transient, so it is not retried (as before normalization,
+                # when it kept the stream's 200 and fell through here)
+                return RetryDecision.no()
+
+            # standard http status code checking (429 was decided above)
             if not is_retryable_http_status(ex.status_code):
                 return RetryDecision.no()
-            if ex.status_code == 429:
-                return RetryDecision.rate_limit(retry_after=retry_after)
             return RetryDecision.transient(retry_after=retry_after)
 
         decision = httpx_classify_retry(ex)
@@ -5047,6 +5052,11 @@ def _warn_refusal_without_fallback(
     )
 
 
+# The HTTP status Anthropic sends with each error type on the Messages API. Batch
+# results classify some of these types differently (`_anthropic_batch.py`): a batch
+# result carries no HTTP response, so it borrows each SDK subclass's own status
+# (a billing error becomes a 403 PermissionDeniedError there). These are the wire
+# statuses, and the sandbox proxy's inverse table must invert exactly this one.
 _ANTHROPIC_ERROR_TYPE_STATUS = {
     "invalid_request_error": 400,
     "authentication_error": 401,
@@ -5060,6 +5070,9 @@ _ANTHROPIC_ERROR_TYPE_STATUS = {
     "timeout_error": 504,
     "overloaded_error": 529,
 }
+
+
+_UNCLASSIFIED_STREAM_ERROR_ATTR = "_inspect_unclassified_stream_error"
 
 
 def _normalize_stream_error(ex: APIStatusError) -> None:
@@ -5076,24 +5089,35 @@ def _normalize_stream_error(ex: APIStatusError) -> None:
     failure. An envelope whose type this table does not name, an envelope whose
     `error` is not a mapping, and an undecodable body all become a 500 -- the
     honest floor for an error we cannot classify -- rather than escaping as a
-    200 that a client would read as a (malformed) reply. The body is left as
-    the SDK captured it so the diagnostic survives. A no-op on an ordinary HTTP
-    error or an already-normalized exception.
+    200 that a client would read as a (malformed) reply. Such an error is also
+    marked unclassified (see `_is_unclassified_stream_error`): the 500 is for
+    reporting, not a claim that the failure is transient, so retry
+    classification does not treat it as one. The body is left as the SDK
+    captured it so the diagnostic survives. A no-op on an ordinary HTTP error
+    or an already-normalized exception.
     """
     if ex.status_code != 200:
         return
-    status = 500
+    status: int | None = None
     error = ex.body.get("error") if isinstance(ex.body, dict) else None
     if isinstance(error, dict):
         error_type = error.get("type")
         if isinstance(error_type, str):
-            status = _ANTHROPIC_ERROR_TYPE_STATUS.get(error_type, 500)
+            status = _ANTHROPIC_ERROR_TYPE_STATUS.get(error_type)
         message = error.get("message")
         if isinstance(message, str):
             ex.message = message
             ex.args = (message,)
+    if status is None:
+        status = 500
+        setattr(ex, _UNCLASSIFIED_STREAM_ERROR_ATTR, True)
     ex.status_code = status
     ex.response.status_code = status
+
+
+def _is_unclassified_stream_error(ex: APIStatusError) -> bool:
+    """Whether `_normalize_stream_error` could not classify this mid-stream error."""
+    return getattr(ex, _UNCLASSIFIED_STREAM_ERROR_ATTR, False) is True
 
 
 def _strip_reasoning(message: ChatMessageAssistant) -> ChatMessageAssistant:

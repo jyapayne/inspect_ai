@@ -173,7 +173,11 @@ def test_every_recognized_error_type_survives_the_proxy_round_trip() -> None:
         / "_agent_bridge"
         / "proxy.py"
     )
-    assert proxy_source.is_file(), f"proxy source not found at {proxy_source}"
+    if not proxy_source.is_file():
+        pytest.skip(
+            f"no sibling inspect_sandbox_tools source at {proxy_source} (not a "
+            "src-layout checkout)"
+        )
     proxy_types = _dict_literal(proxy_source, "_ANTHROPIC_ERROR_TYPES")
 
     lost: dict[str, str] = {}
@@ -210,31 +214,49 @@ def test_unknown_stream_error_type_is_a_server_error_not_a_success() -> None:
     # An SSE error event whose type this provider does not know is still an
     # error the provider reported. It must not keep the stream's 200: the bridge
     # would forward it as a success and a client would read the envelope as a
-    # (malformed) reply instead of raising.
+    # (malformed) reply instead of raising. The 500 is for reporting only: an
+    # error nobody classified is not known to be transient, so it is not
+    # retried (before normalization it kept the 200 and was not retried either).
+    api = AnthropicAPI(model_name="claude-test", api_key="test-key")
     ex = _anthropic_stream_error("some_future_error", "provider said no")
     _normalize_stream_error(ex)
     assert ex.status_code == 500
     assert ex.message == "provider said no"
     assert provider_error_payload(ex)["status"] == 500
+    assert bool(api.should_retry(ex)) is False
+
+
+def test_unclassified_stream_error_still_retries_on_overload_text() -> None:
+    # The message-text fallback predates normalization and still applies: a
+    # mid-stream error the table cannot classify whose text says the provider
+    # is overloaded is transient, exactly as it was when it carried a 200.
+    api = AnthropicAPI(model_name="claude-test", api_key="test-key")
+    ex = _anthropic_stream_error("some_future_error", "Overloaded, try later")
+    decision = api.should_retry(ex)
+    assert not isinstance(decision, bool)
+    assert decision.kind == "transient"
 
 
 @pytest.mark.parametrize(
-    "body",
+    ("body", "retry"),
     [
-        pytest.param("event: error\ndata: not json", id="undecodable-string"),
+        pytest.param("event: error\ndata: not json", False, id="undecodable-string"),
+        # the message-text fallback still reads the raw body, as it always has
         pytest.param(
-            {"type": "error", "error": "overloaded"}, id="error-not-a-mapping"
+            {"type": "error", "error": "overloaded"}, True, id="error-not-a-mapping"
         ),
-        pytest.param({"type": "error"}, id="no-error-member"),
-        pytest.param(None, id="no-body"),
+        pytest.param({"type": "error"}, False, id="no-error-member"),
+        pytest.param(None, False, id="no-body"),
     ],
 )
 def test_malformed_stream_error_is_a_server_error_not_a_success(
-    body: object,
+    body: object, retry: bool
 ) -> None:
     # The SDK raised, so the provider failed the request; whatever shape the
     # event data took, a 200 must not survive normalization. The body stays as
-    # captured so the operator can still see what the provider sent.
+    # captured so the operator can still see what the provider sent. The 500 is
+    # for reporting, not a transient-failure claim: retry classification is what
+    # it was when the error carried a 200 (only the text fallback can retry it).
     ex = APIStatusError(
         "mid-stream error",
         response=httpx2.Response(
@@ -247,6 +269,8 @@ def test_malformed_stream_error_is_a_server_error_not_a_success(
     assert ex.status_code == 500
     assert ex.body == body
     assert provider_error_payload(ex)["status"] == 500
+    api = AnthropicAPI(model_name="claude-test", api_key="test-key")
+    assert bool(api.should_retry(ex)) is retry
 
 
 def test_stream_rate_limit_outranks_an_overloaded_message() -> None:

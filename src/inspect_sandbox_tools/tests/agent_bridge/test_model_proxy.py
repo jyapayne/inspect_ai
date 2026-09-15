@@ -21,8 +21,6 @@ from openai.types.responses import (
     ResponseOutputText,
 )
 
-from tests.conftest import ANTHROPIC_WIRE_ERROR_TYPES
-
 
 @pytest.fixture
 async def http_server() -> AsyncGenerator[tuple[AsyncHTTPServer, str], None]:
@@ -3132,8 +3130,22 @@ async def test_relayed_upstream_response_has_no_cross_origin_headers(
             _assert_no_cross_origin_headers(response.headers)
 
 
+# (forwarded provider HTTP status, the Anthropic error type a bridged client must
+# observe). 409 conflicts and 504 deadlines were surfacing as `api_error`, i.e. as
+# server failures, which a streaming client can only read from this type because
+# the HTTP status is already 200 by then. 422 pins the unlisted-4xx fallback; 503
+# is the control that a real server error still reports `api_error`.
+_ANTHROPIC_WIRE_ERROR_TYPES: list[tuple[int, str]] = [
+    (409, "conflict_error"),
+    (504, "timeout_error"),
+    (402, "billing_error"),
+    (422, "invalid_request_error"),
+    (503, "api_error"),
+]
+
+
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("status", "expected_type"), ANTHROPIC_WIRE_ERROR_TYPES)
+@pytest.mark.parametrize(("status", "expected_type"), _ANTHROPIC_WIRE_ERROR_TYPES)
 @pytest.mark.parametrize("stream", [False, True], ids=["non-streaming", "streaming"])
 async def test_anthropic_sdk_observes_the_providers_error_type(
     status: int, expected_type: str, stream: bool
