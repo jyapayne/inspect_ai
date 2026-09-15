@@ -592,17 +592,24 @@ def _provider_error(result: Any) -> Optional[dict[str, Any]]:
 def _openai_error_body(
     status: int, message: str, provider_body: Optional[dict[str, Any]] = None
 ) -> dict[str, Any]:
-    """OpenAI-dialect error body (Chat Completions and Responses)."""
-    if provider_body is not None:
-        return {"error": provider_body}
-    return {
-        "error": {
-            "message": message,
-            "type": "invalid_request_error" if 400 <= status < 500 else "api_error",
-            "param": None,
-            "code": None,
-        }
+    """OpenAI-dialect error body (Chat Completions and Responses).
+
+    ``provider_body`` is the provider's own error object when the host recovered
+    one (an exhausted retry of an OpenAI-compatible endpoint, say). Its keys are
+    forwarded verbatim over the dialect's own -- clients read ``code`` values such
+    as ``insufficient_quota`` from it -- but the dialect's guaranteed keys stay
+    present: a body that lacks ``message`` (a FastAPI ``{"detail": ...}``, an empty
+    object) still yields the host's recovered message and a ``type``.
+    """
+    error: dict[str, Any] = {
+        "message": message,
+        "type": "invalid_request_error" if 400 <= status < 500 else "api_error",
+        "param": None,
+        "code": None,
     }
+    if provider_body is not None:
+        error.update(provider_body)
+    return {"error": error}
 
 
 _ANTHROPIC_ERROR_TYPES = {

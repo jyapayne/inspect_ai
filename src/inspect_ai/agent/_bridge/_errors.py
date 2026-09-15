@@ -54,17 +54,12 @@ def provider_error_payload(ex: Exception) -> ProviderErrorPayload:
     if isinstance(ex, RetryError):
         if isinstance(ex.__cause__, Exception):
             ex = ex.__cause__
-        else:
-            last_attempt = getattr(ex, "last_attempt", None)
-            if last_attempt is not None and last_attempt.done():
-                attempt_error = last_attempt.exception()
-                if isinstance(attempt_error, Exception):
-                    ex = attempt_error
+        elif ex.last_attempt.done():
+            attempt_error = ex.last_attempt.exception()
+            if isinstance(attempt_error, Exception):
+                ex = attempt_error
 
-    try:
-        message = getattr(ex, "provider_message", None) or str(ex)
-    except Exception:
-        message = type(ex).__name__
+    message = getattr(ex, "provider_message", None) or str(ex)
     payload = ProviderErrorPayload(status=status_code_of(ex), message=message)
 
     try:

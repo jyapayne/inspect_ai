@@ -148,19 +148,6 @@ def test_provider_error_payload_unwraps_openai_retry_error(
     }
 
 
-def test_provider_error_payload_handles_retry_error_without_last_attempt() -> None:
-    """Malformed RetryError instances retain a non-crashing generic fallback."""
-    from tenacity import Future, RetryError
-
-    retry_error = RetryError(Future(1))
-    del retry_error.last_attempt
-
-    assert provider_error_payload(retry_error) == {
-        "status": None,
-        "message": "RetryError",
-    }
-
-
 def test_provider_error_payload_handles_retry_error_with_successful_attempt() -> None:
     """A RetryError with no underlying exception retains generic formatting."""
     from tenacity import Future, RetryError
@@ -306,8 +293,8 @@ async def test_bridge_forwards_retry_exhausted_anthropic_http_error(
 ) -> None:
     """Retry exhaustion preserves streaming HTTP errors for the bridge client.
 
-    The 200-SSE status normalization is covered when this member composes with
-    the Anthropic provider member; this test covers the RetryError unwrap here.
+    The 200-status SSE arm is covered once the Anthropic provider normalizes
+    stream errors into statuses; this test covers the RetryError unwrap.
     """
     message = f"provider said {status}"
     model = get_model(

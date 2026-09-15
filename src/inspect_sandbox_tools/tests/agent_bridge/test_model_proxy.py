@@ -2892,7 +2892,36 @@ async def test_openai_retry_error_forwards_provider_envelope(
         async with ClientSession() as session:
             async with session.post(f"{base_url}{path}", json=request_body) as response:
                 assert response.status == 429
-                assert await response.json() == {"error": body}
+                # the provider's keys win; the dialect's guaranteed keys stay present
+                assert await response.json() == {"error": {"param": None, **body}}
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_body_without_message_keeps_the_dialect_keys() -> None:
+    """A provider body lacking `message` does not cost the client the recovered one.
+
+    An OpenAI-compatible endpoint (a FastAPI service, a local proxy) can answer a
+    429 with `{"detail": ...}`. The host still recovers a message; the client must
+    receive it, plus the dialect's `type`, with the provider's keys alongside.
+    """
+    request_body = {"model": "gpt-5.6", "messages": [{"role": "user", "content": "hi"}]}
+    async with _proxy_with_service(
+        _error_service(429, "rate limited", {"detail": "Too Many Requests"})
+    ) as base_url:
+        async with ClientSession() as session:
+            async with session.post(
+                f"{base_url}/v1/chat/completions", json=request_body
+            ) as response:
+                assert response.status == 429
+                assert await response.json() == {
+                    "error": {
+                        "message": "rate limited",
+                        "type": "invalid_request_error",
+                        "param": None,
+                        "code": None,
+                        "detail": "Too Many Requests",
+                    }
+                }
 
 
 @pytest.mark.asyncio
