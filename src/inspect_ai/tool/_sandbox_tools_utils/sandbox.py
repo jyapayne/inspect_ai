@@ -1,4 +1,5 @@
 import gzip
+import json
 import os
 import stat
 import subprocess
@@ -9,12 +10,14 @@ from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
 from importlib import resources
 from logging import getLogger
 from pathlib import Path
-from typing import AsyncIterator, BinaryIO, Literal, get_args
+from typing import AsyncIterator, BinaryIO, Final, Literal, get_args
 from urllib.parse import unquote, urlparse
 
 import anyio
 import httpx
+import semver
 from rich.prompt import Prompt
+from tenacity import RetryError
 
 import inspect_ai
 from inspect_ai._util.download import download
@@ -60,7 +63,17 @@ from ._build_config import (
 )
 from ._digests import lookup_digest
 
-_BUCKET_BASE_URL = "https://inspect-sandbox-tools.s3.us-east-2.amazonaws.com"
+_DEFAULT_BUCKET_BASE_URL: Final = (
+    "https://github.com/trajectory-labs-pbc/inspect_ai/releases/download/sandbox-tools"
+)
+"""The fork's binary distribution point: assets on the rolling 'sandbox-tools'
+GitHub release. Filenames are versioned (…-v{N}-tl{M}), so the base URL is
+stable; publishing a new version means uploading new assets to the same
+release (see upload_to_github_release in this package)."""
+
+_BUCKET_BASE_URL = os.environ.get(
+    "INSPECT_SANDBOX_TOOLS_BASE_URL", _DEFAULT_BUCKET_BASE_URL
+)
 
 logger = getLogger(__name__)
 
@@ -309,6 +322,28 @@ async def _inject_container_tools_code(sandbox: SandboxEnvironment) -> None:
         result = await sandbox.exec([SANDBOX_CLI, "start-server"], user=user)
         if not result.success:
             raise RuntimeError(f"Failed to start sandbox tools server: {result.stderr}")
+
+        version_result = await sandbox.exec(
+            [SANDBOX_CLI, "exec"],
+            input='{"jsonrpc":"2.0","method":"version","id":1}',
+            user=sandbox._tools_user,
+        )
+        if not version_result.success:
+            raise RuntimeError(
+                f"Failed to query sandbox tools version: {version_result.stderr}"
+            )
+        version_response = json.loads(version_result.stdout)
+        if not isinstance(version_response, dict) or not isinstance(
+            version_response.get("result"), str
+        ):
+            raise RuntimeError("Sandbox tools version response is invalid")
+        binary_version = semver.Version.parse(version_response["result"])
+        expected_build = f"tl.{_get_sandbox_tools_fork_revision()}"
+        if binary_version.build != expected_build:
+            raise RuntimeError(
+                "Sandbox tools fork revision mismatch: "
+                f"expected {expected_build}, got {binary_version.build!r}"
+            )
     except SandboxInjectionError:
         raise
     except Exception as e:
@@ -667,11 +702,19 @@ def _get_sandbox_tools_version() -> str:
     return version_file.read_text().strip()
 
 
+def _get_sandbox_tools_fork_revision() -> int:
+    # Bump for executable-source changes, excluding tests/, design/, and Markdown;
+    # reset to 1 when sandbox_tools_version.txt advances with an upstream version bump.
+    revision_file = Path(__file__).parent / "sandbox_tools_fork_revision.txt"
+    return int(revision_file.read_text().strip())
+
+
 def _get_executable_name(arch: Architecture, dev: bool, musl: bool) -> str:
     return config_to_filename(
         SandboxToolsBuildConfig(
             arch=arch,
             version=int(_get_sandbox_tools_version()),
+            fork_rev=_get_sandbox_tools_fork_revision(),
             suffix="dev" if dev else None,
             musl=musl,
         )
@@ -717,19 +760,46 @@ async def _download_from_s3(filename: str) -> bool:
             executable_path,
         )
         return True
-    except ValueError as e:
-        raise PrerequisiteError(
-            f"Digest verification failed for {filename} downloaded from "
-            f"S3: {e}. The published artifact does not match the digest "
-            f"pinned in this inspect_ai release, which may indicate a "
-            f"compromised or corrupted artifact — please report this to "
-            f"the inspect_ai maintainers rather than retrying."
-        ) from e
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code in (403, 404):
-            print(f"Executable '{filename}' not found on S3")
+    except Exception as e:
+        failure = _download_failure(e)
+        if isinstance(failure, ValueError):
+            raise PrerequisiteError(
+                f"Digest verification failed for {filename} downloaded from "
+                f"S3: {failure}. The published artifact does not match the digest "
+                f"pinned in this inspect_ai release, which may indicate a "
+                f"compromised or corrupted artifact — please report this to "
+                f"the inspect_ai maintainers rather than retrying."
+            ) from failure
+        if isinstance(failure, httpx.HTTPStatusError):
+            if failure.response.status_code in (403, 404):
+                print(f"Executable '{filename}' not found on S3")
+                return False
+            raise failure from e
+        if isinstance(failure, httpx.TransportError):
+            # An unreachable or misconfigured bucket must not be fatal: falling
+            # through to the local build is always preferable to failing injection
+            # (a DNS failure here used to surface as SandboxInjectionError).
+            logger.warning(
+                f"Failed to reach sandbox-tools bucket for '{filename}' ({failure}); "
+                "falling back to a local build."
+            )
             return False
         raise
+
+
+def _download_failure(error: Exception) -> BaseException:
+    """The exception that ended a ``download()``.
+
+    ``download()`` retries transport errors and retryable HTTP statuses and, once
+    its attempts are exhausted, raises tenacity's ``RetryError`` around the last
+    one; the fallback decision has to be made on that last exception, not on the
+    wrapper.
+    """
+    if isinstance(error, RetryError):
+        last = error.last_attempt.exception()
+        if last is not None:
+            return last
+    return error
 
 
 def _download_and_verify_blocking(url: str, sha256: str, dest: Path) -> None:
@@ -877,6 +947,9 @@ def _check_main_divergence(url: str) -> Literal["clean", "edited"]:
         # the CI injectable_src filter (see docstring).
         pathspecs_to_check = [
             ["src/inspect_ai/tool/_sandbox_tools_utils/sandbox_tools_version.txt"],
+            [
+                "src/inspect_ai/tool/_sandbox_tools_utils/sandbox_tools_fork_revision.txt"
+            ],
             [
                 "src/inspect_sandbox_tools",
                 ":(exclude)src/inspect_sandbox_tools/tests",

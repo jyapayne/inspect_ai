@@ -6,12 +6,18 @@ from typing import AsyncIterator, BinaryIO
 
 import pytest
 import semver
-from test_helpers.sandbox import CannedSandbox
+from test_helpers.sandbox import (
+    CannedSandbox,
+    framework_directory_call,
+    is_root_probe,
+    root_probe_result,
+)
 
 from inspect_ai.tool._sandbox_tools_utils import sandbox as sandbox_tools
 from inspect_ai.tool._sandbox_tools_utils.sandbox import SandboxInjectionError
 from inspect_ai.util._sandbox._cli import SANDBOX_CLI, SANDBOX_TOOLS_DIR
-from inspect_ai.util._sandbox._framework_directory import _SHELL, _VERIFIED_MARKER
+from inspect_ai.util._sandbox._framework_directory import _VERIFIED_MARKER
+from inspect_ai.util._sandbox._privileged import SHELL_PATH
 from inspect_ai.util._sandbox.environment import SandboxEnvironment
 from inspect_ai.util._sandbox.recon import Architecture, SupportedContainerOSInfo
 from inspect_ai.util._subprocess import ExecResult
@@ -41,8 +47,22 @@ WRONG_FORK_VERSION = ExecResult(
 """Launcher's answer to the version query: a build from some other fork revision."""
 
 
+DEFAULT_USER = ExecResult(
+    success=True,
+    returncode=0,
+    stdout="Uid: 1111\t1111\t1111\t1111\nGid: 1111\t1111\t1111\t1111\nGroups: 1111 \nHOME: /home/nonroot\nHOME_SET: 1\n",
+    stderr="",
+)
+"""Result of the default-user identity probe that runs once root is the tools user."""
+
+
 def is_framework_dir_call(cmd: list[str]) -> bool:
-    return cmd[:2] == [_SHELL, "-c"] and SANDBOX_TOOLS_DIR.rsplit("/", 1)[1] in cmd
+    call = framework_directory_call(cmd)
+    return call is not None and call.path == SANDBOX_TOOLS_DIR
+
+
+def is_identity_probe(cmd: list[str]) -> bool:
+    return cmd[:2] == [SHELL_PATH, "-c"] and "Groups:" in cmd[2]
 
 
 def is_version_query(cmd: list[str]) -> bool:
@@ -50,7 +70,11 @@ def is_version_query(cmd: list[str]) -> bool:
 
 
 def wrong_fork_binary(cmd: list[str], user: str | None) -> ExecResult[str]:
-    """Every helper call verifies and every command succeeds; only the build is foreign."""
+    """Root is usable, every helper call verifies and every command succeeds; only the build is foreign."""
+    if is_root_probe(cmd):
+        return root_probe_result()
+    if is_identity_probe(cmd):
+        return DEFAULT_USER
     if is_framework_dir_call(cmd):
         return VERIFIED
     return WRONG_FORK_VERSION if is_version_query(cmd) else OK

@@ -5,10 +5,10 @@ A DNS failure on the (placeholder) distribution bucket used to escape
 `SandboxInjectionError` before the local-build fallback could run.
 
 `_download_from_s3` verifies against the vendored SHA256SUMS (see
-`test_sandbox_tools_digests.py` for the verified/unverified/mismatch paths);
-these tests cover names with no sums entry, which take the warn-and-download
-unverified path and so exercise `httpx.stream` directly, same as production
-does for an unpinned name.
+`test_sandbox_tools_digests.py` for the verified/mismatch/missing-entry paths);
+a name with no sums entry never reaches the network, so these tests pin a
+digest for the name under test and exercise the transport through
+`httpx.stream`, same as production does for a pinned name.
 """
 
 from pathlib import Path
@@ -17,8 +17,21 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 import pytest
+import tenacity
 
+from inspect_ai._util import download as download_mod
 from inspect_ai.tool._sandbox_tools_utils import sandbox as sandbox_mod
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run ``download()``'s retry loop without its exponential backoff.
+
+    These tests exercise the exhausted-retries path and must not sleep through it.
+    """
+    monkeypatch.setattr(
+        download_mod, "wait_exponential_jitter", lambda: tenacity.wait_none()
+    )
 
 
 class _FakeStream:
@@ -56,8 +69,9 @@ async def test_default_url_attempts_download(
     (A previous revision short-circuited on the default when it was a
     placeholder; that guard must never come back now that the default works.)
     """
-    filename = "inspect-sandbox-tools-amd64-v26-tl1"  # no SHA256SUMS entry
+    filename = "inspect-sandbox-tools-amd64-v26-tl1"
     monkeypatch.setattr(sandbox_mod, "_binaries_dir", lambda: tmp_path)
+    monkeypatch.setattr(sandbox_mod, "lookup_digest", lambda name: "0" * 64)
 
     requested: list[str] = []
 
@@ -81,8 +95,9 @@ async def test_unreachable_bucket_returns_false(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Transport errors (DNS, refused, timeout) mean 'not available', not fatal."""
-    filename = "inspect-sandbox-tools-amd64-v26-tl1"  # no SHA256SUMS entry
+    filename = "inspect-sandbox-tools-amd64-v26-tl1"
     monkeypatch.setattr(sandbox_mod, "_binaries_dir", lambda: tmp_path)
+    monkeypatch.setattr(sandbox_mod, "lookup_digest", lambda name: "0" * 64)
     monkeypatch.setattr(
         sandbox_mod, "_BUCKET_BASE_URL", "https://definitely-not-resolvable.invalid"
     )
@@ -98,8 +113,9 @@ async def test_http_500_still_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Non-404/403 HTTP errors keep raising: the bucket exists but is broken."""
-    filename = "inspect-sandbox-tools-amd64-v26-tl1"  # no SHA256SUMS entry
+    filename = "inspect-sandbox-tools-amd64-v26-tl1"
     monkeypatch.setattr(sandbox_mod, "_binaries_dir", lambda: tmp_path)
+    monkeypatch.setattr(sandbox_mod, "lookup_digest", lambda name: "0" * 64)
     monkeypatch.setattr(sandbox_mod, "_BUCKET_BASE_URL", "https://bucket.example")
 
     stream_mock = MagicMock(

@@ -34,7 +34,8 @@ def test_version_method(rpc_client: RpcClient) -> None:
     assert "error" not in response
     version = response["result"]
     assert isinstance(version, str)
-    assert len(version.split(".")) == 3
+    # the fork publishes its tools as <upstream version>+tl.<fork revision>
+    assert len(version.split("+")[0].split(".")) == 3
 
 
 def test_socket_creation_and_permissions(rpc_client: RpcClient) -> None:

@@ -153,6 +153,21 @@ TAR_XZF_STDIN = "tar xzf - || { cat >/dev/null; exit 1; }"
 TAR_XF_STDIN = "tar xf - || { cat >/dev/null; exit 1; }"
 
 
+def is_version_query(cmd: list[str]) -> bool:
+    return cmd == [SANDBOX_CLI, "exec"]
+
+
+def version_ok() -> ExecResult[str]:
+    """The fork's post-start version handshake: a binary at the expected fork revision."""
+    fork_rev = sandbox_tools._get_sandbox_tools_fork_revision()
+    return ExecResult(
+        success=True,
+        returncode=0,
+        stdout=f'{{"jsonrpc":"2.0","result":"1.2.1+tl.{fork_rev}","id":1}}',
+        stderr="",
+    )
+
+
 def helper_ok(cmd: list[str], user: str | None) -> ExecResult[str]:
     """Every helper call verifies; every other command succeeds (root is usable)."""
     if is_framework_dir_call(cmd):
@@ -161,6 +176,8 @@ def helper_ok(cmd: list[str], user: str | None) -> ExecResult[str]:
         return DEFAULT_USER
     if is_root_probe(cmd):
         return root_probe_result()
+    if is_version_query(cmd):
+        return version_ok()
     return OK
 
 
@@ -262,7 +279,9 @@ async def test_detector_skips_root_probe_after_rootless_injection(
     def policy(cmd: list[str], user: str | None) -> ExecResult[str]:
         if user == "root":
             raise RuntimeError("runuser: may not be used by non-root users")
-        return REGULAR_FILE if is_framework_dir_call(cmd) else OK
+        if is_framework_dir_call(cmd):
+            return REGULAR_FILE
+        return version_ok() if is_version_query(cmd) else OK
 
     sandbox = CannedSandbox(policy)
     await sandbox_tools._inject_container_tools_code(sandbox)
