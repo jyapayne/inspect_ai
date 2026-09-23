@@ -1263,9 +1263,25 @@ class _ConversationSpanEmitter:
 
         if self._unsubscribe is None:
             self._unsubscribe = transcript()._subscribe(self._on_written)
-        parents = {
+        # The spans this emitter watched being written, then the resident ones --
+        # never `transcript().events`, which on a bounded transcript rebuilds the
+        # whole history from the buffer database on every placement, and hands back
+        # copies whose re-parenting is written to a discarded object. Watched spans
+        # are consulted first: `_event_updated` identifies residency by uuid rather
+        # than identity, so a resident id can carry an object this emitter never saw,
+        # and the watched one is the object whose move will be recorded. Looked up per
+        # node rather than merged, because the watched set grows for the life of the
+        # session while the resident map is bounded.
+        #
+        # An ancestor in neither cannot be resolved, and a span this emitter re-homed
+        # earlier may since have been evicted, so an unresolved ancestor could be
+        # hiding a conversation span that would stop the walk. Once the history is
+        # truncated, leave such a tree alone rather than re-root it on a guess; with
+        # the full history in memory, an unresolved ancestor is the top of the tree,
+        # as before.
+        resident_spans = {
             begin.id: begin
-            for begin in transcript().events
+            for begin in transcript().history.resident_events
             if isinstance(begin, SpanBeginEvent)
         }
         node = event.span_id
@@ -1275,8 +1291,10 @@ class _ConversationSpanEmitter:
             seen.add(node)
             if node in self._span_ids:
                 return
-            begin = parents.get(node)
+            begin = self._late_spans.get(node) or resident_spans.get(node)
             if begin is None:
+                if transcript().history.resident_events_truncated:
+                    return
                 break
             if node in self._late_spans:
                 root = begin
@@ -1318,10 +1336,22 @@ class _ConversationSpanEmitter:
             self._rehomed[former] = span_id
         if self._unsubscribe is None:
             self._unsubscribe = transcript()._subscribe(self._on_written)
-        events = transcript().events
-        try:
-            start = next(i for i, e in enumerate(events) if e is event)
-        except StopIteration:
+        # The resident events, never `transcript().events`: on a bounded transcript
+        # the latter serves the whole logical history from the buffer database, which
+        # costs O(history) on every event written and hands back rebuilt events that
+        # no `is` test can match. An event still being appended is not resident yet
+        # and nothing follows it; one already evicted cannot be located here either,
+        # and both leave the tail alone. A child evicted before its parent was
+        # attributed is not re-homed: against a history provider that costs nothing
+        # real, since the rebuilt events it served never matched `is` either. A
+        # bounded transcript with no provider is the one shape that could re-home
+        # from the full list, and no sample runs in it.
+        events = transcript().history.resident_events
+        start = next(
+            (index for index in reversed(range(len(events))) if events[index] is event),
+            None,
+        )
+        if start is None:
             return
         for child in events[start + 1 :]:
             if isinstance(child, SpanBeginEvent):
