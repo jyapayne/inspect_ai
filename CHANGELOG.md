@@ -3,6 +3,7 @@
 - Bugfix: `inspect score --scorer pkg/name` now resolves `@scanner` functions from installed packages (e.g. `inspect_petri/audit_judge`) instead of failing with `LookupError`; unknown names now report the "scorer couldn't be loaded" guidance rather than a raw traceback.
 - Agent Bridge: `sandbox_agent_bridge()` can now preserve every conversation a sandbox runs, instead of returning only one when the sandbox ran several.
 - Agent Bridge: each preserved conversation now appears as its own transcript span, so multi-conversation sessions read as separate threads instead of one flat list.
+- Agent Bridge: long sandbox sessions no longer slow to a halt, and sub-agent spans keep their conversation, once the transcript starts serving events from the sample buffer.
 
 ## 0.3.265 (17 September 2026)
 

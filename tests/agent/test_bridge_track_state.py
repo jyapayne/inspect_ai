@@ -8,6 +8,7 @@ mode where a longer side call permanently displaced the real conversation.
 """
 
 import dataclasses
+from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
 import anyio
@@ -28,7 +29,8 @@ from inspect_ai.agent._bridge.util import (
     default_code_execution_providers,
     internal_web_search_providers,
 )
-from inspect_ai.event import InfoEvent, ModelEvent, SpanBeginEvent, SpanEndEvent
+from inspect_ai.event import Event, InfoEvent, ModelEvent, SpanBeginEvent, SpanEndEvent
+from inspect_ai.log._recorders.buffer.types import TranscriptEventSink
 from inspect_ai.log._transcript import Transcript, init_transcript, transcript
 from inspect_ai.model._chat_message import (
     ChatMessage,
@@ -2654,6 +2656,177 @@ async def test_a_sub_agent_span_opened_requests_later_still_follows_its_parent_c
     assert child.parent_id == conversation.id
 
 
+class _MaterializingHistory:
+    """A history provider that rebuilds its events, as the buffer database does.
+
+    The real provider reconstructs every event from stored rows, so what it serves
+    is never the object the transcript holds. `materializations` counts how often a
+    caller asked it to rebuild the history, which is the cost the bridge must not
+    pay on the path that runs for every event written.
+    """
+
+    def __init__(self) -> None:
+        self._recorded: list[Event] = []
+        self.materializations = 0
+
+    def record(self, event: Event) -> None:
+        self._recorded.append(event)
+
+    @property
+    def event_count(self) -> int:
+        return len(self._recorded)
+
+    def iter_events(self) -> Iterator[Event]:
+        return iter(self.events())
+
+    def events(self) -> Sequence[Event]:
+        self.materializations += 1
+        return [event.model_copy(deep=True) for event in self._recorded]
+
+    def recent_events(self, n: int | None = None) -> Sequence[Event]:
+        events = self.events()
+        return events if n is None else events[len(events) - n :]
+
+    def events_from(self, start: int, limit: int | None = None) -> Sequence[Event]:
+        events = self.events()[start:]
+        return events if limit is None else events[:limit]
+
+    def events_since_last(self, event_type: type[Event]) -> list[Event]:
+        events = list(self.events())
+        for index in reversed(range(len(events))):
+            if isinstance(events[index], event_type):
+                return events[index + 1 :]
+        return events
+
+    def contains_event(self, event_id: str) -> bool:
+        return any(event.uuid == event_id for event in self._recorded)
+
+    def attachments(self) -> Mapping[str, str]:
+        return {}
+
+    def attachment(self, hash: str) -> str | None:
+        return None
+
+    def export_transcript_events(self, transcript_store: TranscriptEventSink) -> int:
+        return 0
+
+
+async def test_a_sub_agent_span_follows_its_parent_call_on_a_bounded_transcript() -> (
+    None
+):
+    """Re-homing still happens when the transcript serves history from a provider.
+
+    A hosted run is bounded: older events leave memory and `transcript().events`
+    rebuilds them from the buffer database, so the events it yields are never the
+    ones the emitter holds. Searching that view for the parent call by identity
+    found nothing, so the child span was left on the vacated arrival span -- after
+    reading the entire history to discover that.
+    """
+    history = _MaterializingHistory()
+    init_transcript(
+        Transcript(bounded=True, resident_tail=32, history_provider=history)
+    )
+    transcript()._subscribe(history.record)
+    for index in range(64):
+        transcript()._event(InfoEvent(source="filler", data=index))
+    assert transcript().history.resident_events_truncated
+
+    class _SpawningSink:
+        def on_pending(self, event: ModelEvent) -> None:
+            transcript()._event(event)
+
+        def on_complete(self, event: ModelEvent) -> None:
+            transcript()._event(
+                SpanBeginEvent(
+                    id="agent-child",
+                    parent_id=event.span_id,
+                    type="agent",
+                    name="child",
+                )
+            )
+
+    bridge = AgentBridge(
+        AgentState(messages=[ChatMessageUser(content=TASK)]),
+        accumulate_conversations=True,
+        model_event_sink=_SpawningSink(),
+    )
+    async with span("outer", type="agent"):
+        event, _ = await spanned_track(
+            bridge, [TASK_SYSTEM, ChatMessageUser(content=TASK)], "a"
+        )
+
+    resident = transcript().history.resident_events
+    conversation = next(
+        e
+        for e in resident
+        if isinstance(e, SpanBeginEvent) and e.type == BRIDGE_CONVERSATION_SPAN_TYPE
+    )
+    child = next(
+        e for e in resident if isinstance(e, SpanBeginEvent) and e.id == "agent-child"
+    )
+    assert event.span_id == conversation.id
+    assert child.parent_id == conversation.id
+
+
+async def test_releasing_a_held_call_does_not_reread_the_history() -> None:
+    """The write hook must not read the history, on any transcript.
+
+    A sink that holds an event past attribution releases it through the transcript
+    later, and the emitter places it from its write hook. That hook runs for every
+    event a session writes, and it read `transcript().events`: the whole buffer
+    database, rebuilt, every time. That is what pinned a 29-hour session at 100% of
+    one core while it served nothing.
+    """
+    history = _MaterializingHistory()
+    init_transcript(
+        Transcript(bounded=True, resident_tail=32, history_provider=history)
+    )
+    transcript()._subscribe(history.record)
+    for index in range(64):
+        transcript()._event(InfoEvent(source="filler", data=index))
+    assert transcript().history.resident_events_truncated
+
+    class _HoldingSink:
+        def __init__(self) -> None:
+            self.held: ModelEvent | None = None
+
+        def on_pending(self, event: ModelEvent) -> None:
+            self.held = event
+
+        def on_complete(self, event: ModelEvent) -> None: ...
+
+        def release(self) -> None:
+            assert self.held is not None
+            self.held.pending = False
+            transcript()._event(self.held)
+
+    sink = _HoldingSink()
+    bridge = AgentBridge(
+        AgentState(messages=[ChatMessageUser(content=TASK)]),
+        accumulate_conversations=True,
+        model_event_sink=sink,
+    )
+    emitter = bridge.model_event_sink
+    assert emitter is not None
+    one: list[ChatMessage] = [TASK_SYSTEM, ChatMessageUser(content=TASK)]
+    async with span("outer", type="agent"):
+        event = pending_event(one)
+        emitter.on_pending(event)
+        emitter.on_complete(event)
+        await track(bridge, one, "a")
+        before_release = history.materializations
+        sink.release()
+        reads_during_release = history.materializations - before_release
+
+    conversation = next(
+        e
+        for e in transcript().history.resident_events
+        if isinstance(e, SpanBeginEvent) and e.type == BRIDGE_CONVERSATION_SPAN_TYPE
+    )
+    assert event.span_id == conversation.id
+    assert reads_during_release == 0
+
+
 async def test_a_late_child_span_follows_the_tool_calling_parent_not_a_side_call() -> (
     None
 ):
@@ -2904,6 +3077,100 @@ async def test_a_placing_sinks_span_tree_hangs_under_its_conversation() -> None:
     assert event.span_id == f"native-llm-{root.id}-0"  # placement kept
     assert _parent_of(root.id) == conversation.id  # tree re-rooted
     assert _parent_of(event.span_id) == root.id
+
+
+async def test_a_placing_sinks_span_tree_hangs_under_its_conversation_when_bounded() -> (
+    None
+):
+    """Re-rooting a placed tree survives history served from a provider.
+
+    The walk that finds the tree's root read `transcript().events`. On a bounded
+    transcript that rebuilds every span from the buffer database, so the walk
+    re-rooted a rebuilt copy: the copy was discarded, the real tree stayed where
+    the sink put it, and the whole history was re-read for every event written.
+    """
+    history = _MaterializingHistory()
+    init_transcript(
+        Transcript(bounded=True, resident_tail=32, history_provider=history)
+    )
+    transcript()._subscribe(history.record)
+    for index in range(64):
+        transcript()._event(InfoEvent(source="filler", data=index))
+    assert transcript().history.resident_events_truncated
+
+    async with span("human_cli", type="agent"):
+        consumer_ambient = current_span_id()
+        assert consumer_ambient is not None
+        sink = _PlacingSink(consumer_ambient)
+        bridge = AgentBridge(
+            AgentState(messages=[ChatMessageUser(content=TASK)]),
+            accumulate_conversations=True,
+            model_event_sink=sink,
+        )
+        one: list[ChatMessage] = [TASK_SYSTEM, ChatMessageUser(content=TASK)]
+        async with span("Gemini CLI", type="agent"):
+            event, _ = await spanned_track(bridge, one, "first")
+        root = sink.place()
+
+    conversation = next(
+        e
+        for e in transcript().history.resident_events
+        if isinstance(e, SpanBeginEvent) and e.type == BRIDGE_CONVERSATION_SPAN_TYPE
+    )
+    assert event.span_id == f"native-llm-{root.id}-0"
+    assert root.parent_id == conversation.id
+
+
+async def test_an_unresolved_ancestor_leaves_a_placed_tree_where_it_is() -> None:
+    """An ancestor that is neither resident nor watched stops an adoption.
+
+    A span this emitter re-homed earlier can be evicted afterwards, and the walk
+    then cannot see that it already sits under a conversation. Re-rooting on what
+    is still visible would take the tree out of that conversation and into this
+    one. The walk declines instead, and reads nothing from the history provider to
+    find out -- consulting it here would restore the per-event full-history read
+    this guard's own fix removed.
+    """
+    history = _MaterializingHistory()
+    init_transcript(Transcript(bounded=True, resident_tail=4, history_provider=history))
+    transcript()._subscribe(history.record)
+    bridge = AgentBridge(AgentState(messages=[ChatMessageUser(content=TASK)]))
+    emitter = _ConversationSpanEmitter(bridge, writes_events=False)
+    emitter._span_ids.extend(["conversation-a", "conversation-b"])
+
+    transcript()._event(SpanBeginEvent(id="conversation-a", name="conversation a"))
+    parent = pending_event([])
+    parent.span_id = "ambient"
+    transcript()._event(parent)
+    ancestor = SpanBeginEvent(
+        id="ancestor", name="ancestor", type="agent", parent_id="ambient"
+    )
+    transcript()._event(ancestor)
+
+    # Releasing the deferred parent re-homes the ancestor onto conversation a. That
+    # write happens inside the transcript's notification of the parent, whose
+    # re-entrancy guard keeps it from reaching `_on_written`, so the emitter never
+    # watches the ancestor it just moved.
+    emitter._deferred[id(parent)] = ("conversation-a", "ambient")
+    emitter._unsubscribe = transcript()._subscribe(emitter._on_written)
+    transcript()._event_updated(parent)
+    assert ancestor.parent_id == "conversation-a"
+    assert ancestor.id not in emitter._late_spans
+
+    for index in range(12):
+        transcript()._event(InfoEvent(source="filler", data=index))
+    assert not any(e is ancestor for e in transcript().history.resident_events)
+    assert transcript().history.resident_events_truncated
+
+    leaf = SpanBeginEvent(id="leaf", name="leaf", type="model", parent_id=ancestor.id)
+    transcript()._event(leaf)
+    event = pending_event([])
+    event.span_id = leaf.id
+    reads_before = history.materializations
+    emitter._adopt_placement(event, "conversation-b")
+
+    assert leaf.parent_id == ancestor.id
+    assert history.materializations == reads_before
 
 
 async def test_a_placing_sink_keeps_the_consumers_own_spans_where_they_were() -> None:
