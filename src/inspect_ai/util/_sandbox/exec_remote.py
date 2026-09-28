@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import shlex
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar, Literal, TypeVar, Union, cast
 
 import anyio
@@ -114,27 +114,33 @@ class ExecRemoteCommonOptions:
     """Timeout for individual RPC poll requests in seconds. Defaults to 120 seconds.
 
     A poll that times out is re-issued for up to 15 minutes before its timeout is
-    raised, since the sandbox replays any output the lost response carried. Set
+    raised. While the command is running, the sandbox replays any output the lost
+    response carried; if the command ended during the stall, its final output and
+    exit status are lost and `RuntimeError` is raised. Each attempt may itself be
+    retried by the sandbox before it times out (see `poll_timeout_retry`). Set
     `timeout` (awaitable mode) or cancel the caller to bound the total wait.
     """
 
     poll_timeout_retry: bool | None = None
-    """Retry individual RPC poll requests when they time out.
+    """Retry individual RPC requests (start, poll, stdin, kill) when they time out.
     Requests will be retried up to twice, with a timeout of no greater
     than 60 seconds for the first retry and 30 for the second."""
-
-    start_timeout: float | None = None
-    """Timeout for the initial start request in seconds. Defaults to `poll_timeout`.
-
-    Set this above `poll_timeout` when polls should fail fast but launching the
-    command should tolerate a slow sandbox: a poll that times out is retried
-    (the server replays unacknowledged output), while a start that times out is
-    not, because a second start would launch a second process.
-    """
 
     concurrency: bool = True
     """For sandboxes that run locally, request that the `concurrency()`
     function be used to throttle concurrent subprocesses."""
+
+    start_timeout: float | None = field(default=None, kw_only=True)
+    """Timeout for the initial start request in seconds.
+
+    Defaults to `poll_timeout` (120 seconds if that is unset). Set this above
+    `poll_timeout` when a stalled poll should be noticed and re-issued quickly but
+    launching the command should tolerate a slow sandbox. exec_remote re-issues a
+    poll that times out but never a start, since a second start would launch a
+    second process. Unless `poll_timeout_retry` is False, a sandbox that retries
+    timed-out commands (Docker does by default) can still re-run a start that
+    times out.
+    """
 
 
 @dataclass
@@ -213,13 +219,15 @@ RPC_TIMEOUT = 120
 POLL_TIMEOUT_RIDE_THROUGH_SECONDS: float = 900.0
 """Seconds to keep re-polling after a poll RPC first times out.
 
-A poll that times out has lost a response, not the process: the sandbox
-server holds every output chunk until the host acknowledges it (``ack_seq``),
-so re-issuing the same poll replays whatever the lost response carried. The
-budget is counted from the first timeout, so a long first attempt cannot use
-it up, and a re-poll already in flight when it runs out is allowed to finish;
-then the last timeout is raised unchanged. Only polls ride through --
-``exec_remote_start`` and ``write_stdin`` are not safe to repeat.
+While the command is running, a poll that times out has lost a response, not
+the process: the sandbox server holds every output chunk until the host
+acknowledges it (``ack_seq``), so re-issuing the same poll replays whatever the
+lost response carried. (A command that ended during the stall has been retired
+with its final output; see ``_poll``.) The budget is counted from the first
+timeout, so a long first attempt cannot use it up, and a re-poll already in
+flight when it runs out is allowed to finish; then the last timeout is raised
+unchanged. Only polls ride through -- ``exec_remote_start`` and ``write_stdin``
+are not safe to repeat.
 """
 
 POLL_TIMEOUT_RIDE_THROUGH_WAIT_SECONDS: float = 5.0

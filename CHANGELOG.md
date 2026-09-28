@@ -1,7 +1,7 @@
 ## Unreleased
 
 - Bugfix: `inspect score --scorer pkg/name` now resolves `@scanner` functions from installed packages (e.g. `inspect_petri/audit_judge`) instead of failing with `LookupError`; unknown names now report the "scorer couldn't be loaded" guidance rather than a raw traceback.
-- Bugfix: `sandbox.exec_remote()` (and so bridged agents) no longer fails when the sandbox stops answering for up to 15 minutes; a new `start_timeout` option bounds the launch separately.
+- Bugfix: `sandbox.exec_remote()` (and so bridged agents) no longer fails when the sandbox stops answering for up to 15 minutes while the command runs; a new `start_timeout` option bounds the launch separately.
 
 ## 0.3.265 (17 September 2026)
 

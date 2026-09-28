@@ -318,7 +318,8 @@ class TestPollRideThrough:
         assert not isinstance(raised.value, SandboxTimeoutError)
         assert [method for method, _ in sandbox.requests][-1] == "exec_remote_kill"
 
-    async def test_exec_remote_start_timeout_is_not_retried(self) -> None:
+    async def test_exec_remote_does_not_reissue_a_timed_out_start(self) -> None:
+        """Only polls ride through; a sandbox's own timeout retry is outside this mock."""
         sandbox = _make_scripted_sandbox(
             [SandboxTimeoutError("the pod is not answering.")]
         )
@@ -378,7 +379,7 @@ class TestPollRideThrough:
                 await proc._poll()
 
     async def test_start_timeout_is_independent_of_poll_timeout(self) -> None:
-        """A start cannot be retried, so a caller may let it outlast a fast-failing poll."""
+        """exec_remote never re-issues a start, so a caller may give it longer than a poll."""
         sandbox = _make_scripted_sandbox(
             [_start_response(42), _poll_response(state="completed", exit_code=0, seq=0)]
         )
@@ -800,6 +801,65 @@ class TestPollTimeoutOptions:
 
         kwargs = sandbox.exec.call_args_list[0].kwargs
         assert kwargs["timeout_retry"] is True
+
+
+# ============================================================================
+# Options positional order
+# ============================================================================
+
+_BASE_POSITIONAL: tuple[object, ...] = (
+    "in",
+    "/work",
+    {"K": "V"},
+    "someone",
+    7.0,
+    30.0,
+    False,
+    False,
+)
+
+
+def _base_fields(options: ExecRemoteCommonOptions) -> tuple[object, ...]:
+    return (
+        options.input,
+        options.cwd,
+        options.env,
+        options.user,
+        options.poll_interval,
+        options.poll_timeout,
+        options.poll_timeout_retry,
+        options.concurrency,
+    )
+
+
+class TestOptionsPositionalOrder:
+    """New options are keyword-only, so positional callers keep their meaning."""
+
+    def test_common_options(self) -> None:
+        options = ExecRemoteCommonOptions(
+            "in", "/work", {"K": "V"}, "someone", 7.0, 30.0, False, False
+        )
+
+        assert _base_fields(options) == _BASE_POSITIONAL
+        assert options.start_timeout is None
+
+    def test_streaming_options(self) -> None:
+        options = ExecRemoteStreamingOptions(
+            "in", "/work", {"K": "V"}, "someone", 7.0, 30.0, False, False, True
+        )
+
+        assert _base_fields(options) == _BASE_POSITIONAL
+        assert options.stdin_open is True
+        assert options.start_timeout is None
+
+    def test_awaitable_options(self) -> None:
+        options = ExecRemoteAwaitableOptions(
+            "in", "/work", {"K": "V"}, "someone", 7.0, 30.0, False, False, 12.0
+        )
+
+        assert _base_fields(options) == _BASE_POSITIONAL
+        assert options.timeout == 12.0
+        assert options.start_timeout is None
 
 
 # ============================================================================
