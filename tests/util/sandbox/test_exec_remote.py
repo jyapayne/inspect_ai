@@ -16,13 +16,17 @@ import pytest
 from tenacity.wait import wait_none
 from test_helpers.utils import skip_if_no_docker
 
+import inspect_ai.util._sandbox.exec_remote as exec_remote_module
 from inspect_ai.tool._sandbox_tools_utils.sandbox import (
     SandboxInjectionError,
     _inject_container_tools_code,
 )
 from inspect_ai.util._sandbox.docker.docker import DockerSandboxEnvironment
 from inspect_ai.util._sandbox.environment import SandboxDefaultUser
-from inspect_ai.util._sandbox.events import SandboxEnvironmentProxy
+from inspect_ai.util._sandbox.events import (
+    SandboxEnvironmentProxy,
+    SandboxTimeoutError,
+)
 from inspect_ai.util._sandbox.exec_remote import (
     ExecCompleted,
     ExecRemoteAwaitableOptions,
@@ -149,6 +153,39 @@ def _make_never_completing_sandbox() -> AsyncMock:
     return sandbox
 
 
+def _rpc_error(message: str, code: int = -32099, id: int = 1) -> str:
+    """Create a JSON-RPC error response string (default: the server's ToolException code)."""
+    return json.dumps(
+        {"jsonrpc": "2.0", "error": {"code": code, "message": message}, "id": id}
+    )
+
+
+def _make_scripted_sandbox(script: list[str | Exception]) -> AsyncMock:
+    """Create a mock sandbox whose exec() answers from `script` in order.
+
+    A str entry is returned as stdout; an Exception entry is raised. When the
+    script runs out, the last entry repeats. Every JSON-RPC request's method and
+    params are recorded in `sandbox.requests`.
+    """
+    sandbox = _mock_sandbox()
+    sandbox.default_polling_interval.return_value = 5
+    sandbox.no_events = _no_events_context
+    requests: list[tuple[str, dict[str, Any]]] = []
+    sandbox.requests = requests
+    steps = list(script)
+
+    async def fake_exec(*args: Any, **kwargs: Any) -> ExecResult[str]:
+        request = json.loads(kwargs["input"])
+        requests.append((request["method"], request.get("params", {})))
+        step = steps.pop(0) if len(steps) > 1 else steps[0]
+        if isinstance(step, Exception):
+            raise step
+        return ExecResult(success=True, returncode=0, stdout=step, stderr="")
+
+    sandbox.exec = AsyncMock(side_effect=fake_exec)
+    return sandbox
+
+
 # ============================================================================
 # Single-use iterator
 # ============================================================================
@@ -196,6 +233,166 @@ class TestPollRetryExhaustion:
         # stop_after_attempt(5) pins the attempt count; keep the assertion
         # exact so a stop-config regression is caught
         assert sandbox.exec.call_count == 5
+
+
+# ============================================================================
+# Poll ride-through on sandbox exec timeouts
+# ============================================================================
+
+
+class TestPollRideThrough:
+    async def test_poll_rides_through_sandbox_timeouts_without_losing_output(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            exec_remote_module, "POLL_TIMEOUT_RIDE_THROUGH_WAIT_SECONDS", 0.0
+        )
+        stall = SandboxTimeoutError(
+            "Command exceeded its 90s timeout and the pod did not report completion "
+            "within a further 30s; the pod is not answering."
+        )
+        sandbox = _make_scripted_sandbox(
+            [
+                _start_response(42),
+                _poll_response(state="running", exit_code=None, stdout="A", seq=1),
+                stall,
+                stall,
+                _poll_response(state="running", exit_code=None, stdout="B", seq=2),
+                _poll_response(state="completed", exit_code=0, seq=2),
+            ]
+        )
+        proc = await exec_remote_streaming(sandbox, ["cmd"], 5)
+
+        events = [event async for event in proc]
+
+        assert events == [
+            ExecStdout(data="A"),
+            ExecStdout(data="B"),
+            ExecCompleted(exit_code=0),
+        ]
+        acks = [
+            params["ack_seq"]
+            for method, params in sandbox.requests
+            if method == "exec_remote_poll"
+        ]
+        # The two timed-out polls and the poll that finally answered all asked the
+        # server to replay from seq 1: nothing after "A" was acknowledged until "B"
+        # arrived.
+        assert acks == [0, 1, 1, 1, 2]
+
+    async def test_poll_ride_through_budget_exhausted_reraises_the_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            exec_remote_module, "POLL_TIMEOUT_RIDE_THROUGH_SECONDS", 0.3
+        )
+        monkeypatch.setattr(
+            exec_remote_module, "POLL_TIMEOUT_RIDE_THROUGH_WAIT_SECONDS", 0.05
+        )
+        sandbox = _make_scripted_sandbox(
+            [_start_response(42), SandboxTimeoutError("the pod is not answering.")]
+        )
+        proc = await exec_remote_streaming(sandbox, ["cmd"], 5)
+
+        with pytest.raises(TimeoutError, match="the pod is not answering") as raised:
+            await proc._poll()
+
+        assert isinstance(raised.value, SandboxTimeoutError)
+
+        polls = [m for m, _ in sandbox.requests if m == "exec_remote_poll"]
+        assert 2 <= len(polls) <= 10
+
+    async def test_callers_own_timeout_is_never_ridden_through(self) -> None:
+        """An outer deadline cancels a ride-through at once and still kills the process."""
+        sandbox = _make_scripted_sandbox(
+            [_start_response(42), SandboxTimeoutError("the pod is not answering.")]
+        )
+
+        with pytest.raises(TimeoutError) as raised:
+            await exec_remote_awaitable(
+                sandbox, ["cmd"], 5, ExecRemoteAwaitableOptions(timeout=0.5)
+            )
+
+        # The caller's own deadline, not the sandbox's timeout re-raised once the
+        # ride-through budget ran out.
+        assert not isinstance(raised.value, SandboxTimeoutError)
+        assert [method for method, _ in sandbox.requests][-1] == "exec_remote_kill"
+
+    async def test_exec_remote_start_timeout_is_not_retried(self) -> None:
+        sandbox = _make_scripted_sandbox(
+            [SandboxTimeoutError("the pod is not answering.")]
+        )
+
+        with pytest.raises(TimeoutError):
+            await exec_remote_streaming(sandbox, ["cmd"], 5)
+
+        assert sandbox.exec.call_count == 1
+
+    async def test_poll_after_ride_through_names_a_lost_terminal_state(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            exec_remote_module, "POLL_TIMEOUT_RIDE_THROUGH_WAIT_SECONDS", 0.0
+        )
+        sandbox = _make_scripted_sandbox(
+            [
+                _start_response(42),
+                SandboxTimeoutError("the pod is not answering."),
+                _rpc_error("No job found with pid 42"),
+            ]
+        )
+        proc = await exec_remote_streaming(sandbox, ["cmd"], 5)
+
+        # The inner RuntimeError retry would otherwise back off for ~30s.
+        with patch(
+            "inspect_ai.util._sandbox.exec_remote.wait_exponential_jitter",
+            new=lambda *a, **k: wait_none(),
+        ):
+            with pytest.raises(RuntimeError, match="ended during the stall") as raised:
+                await proc._poll()
+
+        assert raised.value.__cause__ is not None
+        assert "No job found with pid 42" in str(raised.value.__cause__)
+
+    @pytest.mark.parametrize(("stalled", "killed"), [(False, False), (True, True)])
+    async def test_no_job_found_stays_the_servers_error_unless_a_live_poll_stalled(
+        self, monkeypatch: pytest.MonkeyPatch, stalled: bool, killed: bool
+    ) -> None:
+        """Without a timed-out poll, or once the caller killed the process, nothing was lost."""
+        monkeypatch.setattr(
+            exec_remote_module, "POLL_TIMEOUT_RIDE_THROUGH_WAIT_SECONDS", 0.0
+        )
+        script: list[str | Exception] = [_start_response(42)]
+        if stalled:
+            script.append(SandboxTimeoutError("the pod is not answering."))
+        script.append(_rpc_error("No job found with pid 42"))
+        sandbox = _make_scripted_sandbox(script)
+        proc = await exec_remote_streaming(sandbox, ["cmd"], 5)
+        proc._killed = killed
+
+        with patch(
+            "inspect_ai.util._sandbox.exec_remote.wait_exponential_jitter",
+            new=lambda *a, **k: wait_none(),
+        ):
+            with pytest.raises(RuntimeError, match=r"^No job found with pid 42$"):
+                await proc._poll()
+
+    async def test_start_timeout_is_independent_of_poll_timeout(self) -> None:
+        """A start cannot be retried, so a caller may let it outlast a fast-failing poll."""
+        sandbox = _make_scripted_sandbox(
+            [_start_response(42), _poll_response(state="completed", exit_code=0, seq=0)]
+        )
+        proc = await exec_remote_streaming(
+            sandbox,
+            ["cmd"],
+            5,
+            ExecRemoteCommonOptions(poll_timeout=90, start_timeout=600),
+        )
+
+        _ = [event async for event in proc]
+
+        timeouts = [call.kwargs["timeout"] for call in sandbox.exec.call_args_list]
+        assert timeouts == [600, 90]
 
 
 class TestKill:

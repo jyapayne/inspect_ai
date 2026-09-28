@@ -45,6 +45,18 @@ if TYPE_CHECKING:
 
 logger = getLogger(__name__)
 
+# How long one poll of the in-sandbox proxy's exec stream may take before the
+# sandbox reports it as not answering. Small, so a stalled exec path is noticed
+# after one poll timeout (plus any grace the sandbox adds) and re-polled, since
+# exec_remote rides the timeout through, rather than after ten minutes; kill() at
+# unwind shares it.
+PROXY_POLL_TIMEOUT_SECONDS = 90
+
+# A start is one shot and cannot be retried, so it keeps the 600s tolerance the
+# poll timeout used to give it: a sandbox that is merely slow to launch the proxy
+# still launches it.
+PROXY_START_TIMEOUT_SECONDS = 600
+
 
 @contextlib.asynccontextmanager
 async def sandbox_agent_bridge(
@@ -225,7 +237,8 @@ async def sandbox_agent_bridge(
                         f"{MODEL_SERVICE.upper()}_PORT": str(port),
                         f"{MODEL_SERVICE.upper()}_INSTANCE": instance,
                     },
-                    poll_timeout=600,
+                    poll_timeout=PROXY_POLL_TIMEOUT_SECONDS,
+                    start_timeout=PROXY_START_TIMEOUT_SECONDS,
                 ),
             )
 
