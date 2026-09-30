@@ -171,6 +171,11 @@ async def project_cleanup_shutdown(cleanup: bool) -> None:
     The batch's ``SandboxManager`` calls this once per Docker config it
     started, at the end of the batch. Every entry processed is released, so
     the repeat calls do nothing and no entry carries into a later batch.
+
+    Without ``cleanup``, a reported project's generated compose file is
+    released but kept on disk: ``inspect sandbox cleanup docker <project>``
+    needs that exact config, which may declare networks the generic fallback
+    cannot remove.
     """
     state = cleanup_state()
 
@@ -193,19 +198,21 @@ async def project_cleanup_shutdown(cleanup: bool) -> None:
             )
             table.add_column("Sample ID")
             table.add_column("Epoch")
-            table.add_column("Container(s)", no_wrap=True)
+            table.add_column("Project", no_wrap=True)
+            table.add_column("Container(s)", overflow="fold")
             for project in shutdown_projects:
                 containers = await compose_ps(project, all=True)
                 table.add_row(
                     str(project.sample_id) if project.sample_id is not None else "",
                     str(project.epoch if project.epoch is not None else ""),
+                    project.name,
                     "\n".join(container["Name"] for container in containers),
                 )
             print(table)
             print(
                 "\n"
-                "Cleanup all containers  : [blue]inspect sandbox cleanup docker[/blue]\n"
-                "Cleanup single container: [blue]inspect sandbox cleanup docker <container-id>[/blue]",
+                "Cleanup all environments  : [blue]inspect sandbox cleanup docker[/blue]\n"
+                "Cleanup single environment: [blue]inspect sandbox cleanup docker <project>[/blue]",
                 "\n",
             )
 
@@ -214,9 +221,15 @@ async def project_cleanup_shutdown(cleanup: bool) -> None:
         if project in state.running_projects:
             state.running_projects.remove(project)
 
-    # remove auto-compose files
+    # remove auto-compose files (keeping those of projects handed to the user)
+    retained: set[str] = (
+        set()
+        if cleanup
+        else {project.config for project in shutdown_projects if project.config}
+    )
     for file in list(state.auto_compose_files):
-        safe_cleanup_auto_compose(file)
+        if file not in retained:
+            safe_cleanup_auto_compose(file)
         state.auto_compose_files.discard(file)
 
     state.closed = True

@@ -325,7 +325,9 @@ async def test_shutdown_releases_the_registry(
     With cleanup on it is brought down; with `--no-sandbox-cleanup` it is
     reported for `inspect sandbox cleanup docker` and left running. Either
     way the registry releases it and its compose files, so nothing is
-    retained for a later batch to clean twice or report again.
+    retained for a later batch to clean twice or report again. A reported
+    project's generated compose file stays on disk, through the repeat
+    `task_cleanup` too, for that later project-scoped cleanup to use.
     """
     with sandbox_lifecycle_scope():
         await run_lifecycle(fake_docker, None, cleanup=cleanup, interrupted=True)
@@ -338,11 +340,15 @@ async def test_shutdown_releases_the_registry(
     if cleanup:
         assert fake_docker.events == ["up:None", "down:None"]
         assert fake_docker.reported == []
+        assert fake_docker.generated_files() == []
     else:
         assert fake_docker.events == ["up:None"]
         assert fake_docker.reported == ["ps:None"]
         assert len(fake_docker.running) == 1
-    assert fake_docker.generated_files() == []
+        # the startup project's file is gone; the reported project's is kept
+        assert fake_docker.generated_files() == [
+            f"{name}.yaml" for name in fake_docker.running
+        ]
 
 
 async def test_repeated_task_init_preserves_registered_resources(
