@@ -1,8 +1,0 @@
-services:
-  default:
-    build:
-      context: .
-      dockerfile: sandbox-service.Dockerfile
-    user: nonroot
-    working_dir: /home/nonroot
-    init: true
