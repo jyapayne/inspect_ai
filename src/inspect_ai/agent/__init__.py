@@ -5,6 +5,7 @@ from ._as_solver import as_solver
 from ._as_tool import as_tool
 from ._bridge.bridge import agent_bridge, bridge
 from ._bridge.sandbox.bridge import sandbox_agent_bridge
+from ._bridge.sandbox.proxy import ModelProxy, ModelProxyError, sandbox_model_proxy
 from ._bridge.sandbox.types import SandboxAgentBridge
 from ._bridge.types import AgentBridge
 from ._channel import (
@@ -35,6 +36,9 @@ __all__ = [
     "as_solver",
     "agent_bridge",
     "sandbox_agent_bridge",
+    "sandbox_model_proxy",
+    "ModelProxy",
+    "ModelProxyError",
     "AgentBridge",
     "SandboxAgentBridge",
     "BridgedToolsSpec",
