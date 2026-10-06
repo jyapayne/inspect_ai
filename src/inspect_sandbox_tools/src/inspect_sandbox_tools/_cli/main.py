@@ -7,7 +7,7 @@ import socket
 import subprocess
 import sys
 import time
-from typing import Literal
+from typing import Literal, NamedTuple
 
 import aiohttp
 import psutil
@@ -367,7 +367,7 @@ def _server_process_is_running() -> bool:
     if metadata is None:
         return False
     try:
-        return psutil.Process(metadata["pid"]).create_time() == metadata["created_at"]
+        return psutil.Process(metadata.pid).create_time() == metadata.created_at
     except psutil.NoSuchProcess:
         return False
 
@@ -395,7 +395,7 @@ def _terminate_unresponsive_server() -> None:
         return
 
     try:
-        process = psutil.Process(metadata["pid"])
+        process = psutil.Process(metadata.pid)
         process.terminate()
         process.wait(timeout=_SERVER_PROCESS_STOP_TIMEOUT)
     except psutil.TimeoutExpired:
@@ -414,7 +414,12 @@ def _clear_stale_server_state() -> None:
     SHUTDOWN_STATUS_PATH.unlink(missing_ok=True)
 
 
-def _server_process_metadata() -> dict[str, int | float] | None:
+class _ServerProcessMetadata(NamedTuple):
+    pid: int
+    created_at: int | float
+
+
+def _server_process_metadata() -> _ServerProcessMetadata | None:
     try:
         metadata = json.loads(read_private_text(SERVER_PID_PATH))
         pid = metadata["pid"]
@@ -423,7 +428,7 @@ def _server_process_metadata() -> dict[str, int | float] | None:
         return None
     if type(pid) is not int or pid <= 0 or type(created_at) not in (int, float):
         return None
-    return {"pid": pid, "created_at": created_at}
+    return _ServerProcessMetadata(pid, created_at)
 
 
 def _parse_args() -> argparse.Namespace:

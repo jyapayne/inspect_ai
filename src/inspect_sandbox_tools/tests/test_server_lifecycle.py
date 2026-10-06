@@ -516,8 +516,15 @@ def test_server_process_metadata_refuses_symlinked_pid_file(
 @pytest.mark.parametrize(
     "pid,created_at",
     [
-        (True, 1.0), (False, 1.0), (0, 1.0), (-1, 1.0),
-        (123.0, 1.0), ("123", 1.0), (123, True), (123, "1.0"), (None, 1.0),
+        (True, 1.0),
+        (False, 1.0),
+        (0, 1.0),
+        (-1, 1.0),
+        (123.0, 1.0),
+        ("123", 1.0),
+        (123, True),
+        (123, "1.0"),
+        (None, 1.0),
     ],
 )
 def test_invalid_server_pid_metadata_never_inspects_or_signals_a_process(

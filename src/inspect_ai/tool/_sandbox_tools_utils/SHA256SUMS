@@ -7,6 +7,7 @@
 b0a262493e3c1d6081a3c0214b393ed1db11049f624aa674b337e777831b7b75  inspect-sandbox-tools-amd64-musl-v31-tl1
 52a4cbcacedfdb47db3cb6a7127541683979a716bad5fef05c6231e110c72af2  inspect-sandbox-tools-amd64-musl-v32
 53d2a93f5d5b822a82efc963d23fceb70f09f968f9e5ddee6b6b3431d75d145b  inspect-sandbox-tools-amd64-musl-v32-tl1
+90ea650c22cc5b90d716a195513fca68a6c5016efdb55004321e38d914d5abaa  inspect-sandbox-tools-amd64-musl-v32-tl2
 f881a000e152f319b6f32e33d740642e1a01b2495fa8afdeb1dc89dbaf62fbfd  inspect-sandbox-tools-amd64-v29-tl1
 f00fe55b92a675787de4227df36a43337a0f7cfa8c27b630847be830ed89611f  inspect-sandbox-tools-amd64-v30-tl1
 66fc8532c2fa804c04f5067d42434c1d01e2f083e5d6ef5d012768b2ea232d8a  inspect-sandbox-tools-amd64-v30-tl2
@@ -16,6 +17,7 @@ d112208e0f2be6e7e202b9ed780e82c96d3e6a71ec385f6cbca2d9d55ae79342  inspect-sandbo
 8a72a4ccf3347f423472c610e8c8702ae45627d673adde6317d450ca5efa47c1  inspect-sandbox-tools-amd64-v31-tl1
 21375468a95a05a2a036cdd5249e4be5cffe29dfbf40be003ad05018442b35ce  inspect-sandbox-tools-amd64-v32
 52587f9eca8a267988a2ce693cb732529c0e638a323fc01190897c6621c4a3de  inspect-sandbox-tools-amd64-v32-tl1
+a9db30340de11bb0d6b71b2ff3756caebcb35bfa1120b7c41f8bada12b21e9da  inspect-sandbox-tools-amd64-v32-tl2
 ab103d7b616e2e97c8d88e75864c2dda433c032b8afde221ed42376e56db20b9  inspect-sandbox-tools-arm64-musl-v29-tl1
 d02549a8f6e61b3dda7d4291cb4e2f275a43dc67ccfa88954ece0b0177696ff8  inspect-sandbox-tools-arm64-musl-v30-tl1
 ab6d00bb5bc4a62a75cbbcd172a7166dcdb426e2b3bae047bc08f549a8e018bc  inspect-sandbox-tools-arm64-musl-v30-tl2

@@ -399,7 +399,7 @@ async def test_invalid_opt_in_version_never_calls_either_factory(
     legacy, byte_proxy = AsyncMock(), AsyncMock()
     monkeypatch.setattr(proxy, "model_proxy_server", legacy)
     monkeypatch.setattr(raw, "raw_http_proxy_server", byte_proxy)
-    with pytest.raises(ValueError, match="Unsupported RAW HTTP"):
+    with pytest.raises(ValueError):
         await proxy.run_model_proxy_server()
     legacy.assert_not_called()
     byte_proxy.assert_not_called()

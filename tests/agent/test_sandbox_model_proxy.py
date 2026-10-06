@@ -263,13 +263,19 @@ async def test_raw_method_contract_is_refused_before_injection(invalid: str) -> 
 
 @pytest.mark.parametrize(
     "stdout,success",
-    [("", False), ("invalid", True), ("{}", True),
-     ('{"raw_http_version":true}', True), ('{"raw_http_version":2}', True)],
+    [
+        ("", False),
+        ("invalid", True),
+        ("{}", True),
+        ('{"raw_http_version":true}', True),
+        ('{"raw_http_version":2}', True),
+    ],
 )
 async def test_raw_capability_requires_the_installed_binary(
     monkeypatch: pytest.MonkeyPatch, stdout: str, success: bool
 ) -> None:
     environment = _unused_sandbox()
+    environment._tools_user = "root"
     environment.exec = AsyncMock(
         return_value=ExecResult(
             success=success, returncode=0 if success else 2, stdout=stdout, stderr=""
@@ -281,7 +287,9 @@ async def test_raw_capability_requires_the_installed_binary(
     runner = MagicMock()
     monkeypatch.setattr(proxy_module, "_model_proxy_service", runner)
     with pytest.raises(RuntimeError, match="bundle does not support"):
-        async with sandbox_model_proxy(environment, methods=_raw_methods(), raw_http=True):
+        async with sandbox_model_proxy(
+            environment, methods=_raw_methods(), raw_http=True
+        ):
             pytest.fail("Unsupported raw binary was accepted")
     runner.assert_not_called()
 
@@ -302,7 +310,9 @@ async def test_raw_public_proxy_requires_handshake_without_model_state(
         return_value={"version": 2 if ready == "rejected" else 1}
     )
     response: JsonValue = {
-        "version": 1, "status": 529, "response_id": "opaque",
+        "version": 1,
+        "status": 529,
+        "response_id": "opaque",
         "headers": [["x-provider-field", "first"], ["x-provider-field", "second"]],
     }
     methods["raw_http_start"] = AsyncMock(return_value=response)
@@ -316,9 +326,16 @@ async def test_raw_public_proxy_requires_handshake_without_model_state(
         if ready != "missing":
             await served["raw_http_ready"](version=2 if ready == "wrong_version" else 1)
         # No ModelProxyError/status conversion is introduced in the raw path.
-        assert await served["raw_http_start"](
-            version=1, method="POST", path="/v1/messages", headers=[], body_b64="AA=="
-        ) is response
+        assert (
+            await served["raw_http_start"](
+                version=1,
+                method="POST",
+                path="/v1/messages",
+                headers=[],
+                body_b64="AA==",
+            )
+            is response
+        )
         yield
 
     monkeypatch.setattr(
@@ -330,7 +347,9 @@ async def test_raw_public_proxy_requires_handshake_without_model_state(
         proxy_module, "AgentState", MagicMock(side_effect=AssertionError("agent state"))
     )
     monkeypatch.setattr(
-        proxy_module, "SandboxAgentBridge", MagicMock(side_effect=AssertionError("bridge"))
+        proxy_module,
+        "SandboxAgentBridge",
+        MagicMock(side_effect=AssertionError("bridge")),
     )
     if ready == "accepted":
         async with sandbox_model_proxy(
@@ -339,7 +358,8 @@ async def test_raw_public_proxy_requires_handshake_without_model_state(
             assert proxy == ModelProxy(port=14141)
         environment.exec.assert_awaited_once_with(
             [proxy_module.SANDBOX_CLI, "model_proxy", "--capabilities"],
-            user="root", timeout=30,
+            user="root",
+            timeout=30,
         )
     else:
         with pytest.raises(RuntimeError, match="protocol"):

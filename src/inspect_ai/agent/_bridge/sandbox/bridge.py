@@ -300,7 +300,8 @@ async def _model_proxy_service(
                                     sorted(bridge.model_event_metadata_headers)
                                 )
                             }
-                            if bridge is not None and bridge.model_event_metadata_headers
+                            if bridge is not None
+                            and bridge.model_event_metadata_headers
                             else {}
                         ),
                     },

@@ -74,7 +74,9 @@ async def test_raw_monitor_allows_owned_shutdown() -> None:
     closing = anyio.Event()
     closing.set()
     await _monitor_proxy(
-        FakeProcess([ExecCompleted(exit_code=0)]), True, closing  # type: ignore[arg-type]
+        FakeProcess([ExecCompleted(exit_code=0)]),
+        True,
+        closing,  # type: ignore[arg-type]
     )
 
 
