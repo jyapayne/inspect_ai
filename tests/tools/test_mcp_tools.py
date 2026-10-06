@@ -7,6 +7,7 @@ import weakref
 from pathlib import Path
 from types import SimpleNamespace, TracebackType
 from typing import Any, AsyncIterator, Callable
+from unittest.mock import MagicMock
 from uuid import uuid4
 
 import anyio
@@ -33,7 +34,7 @@ from inspect_ai.tool import (
 )
 from inspect_ai.tool._mcp.tools import MCPToolSourceLocal
 from inspect_ai.tool._tool_def import ToolDef
-from inspect_ai.util import sandbox
+from inspect_ai.util import SandboxEnvironment, sandbox
 
 if sys.version_info < (3, 11):
     from exceptiongroup import BaseExceptionGroup
@@ -265,7 +266,9 @@ def _patch_sandbox_module(monkeypatch, exec_model_request_impl):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
 
-    async def _fake_sandbox_with_injected_tools(*, sandbox_name: Any = None) -> Any:
+    async def _fake_sandbox_with_injected_tools(
+        *, sandbox_name: Any = None, sandbox: Any = None
+    ) -> Any:
         return SimpleNamespace(_tools_user=None, _tools_default_user=None)
 
     async def _fake_exec_scalar_request(*args: Any, **kwargs: Any) -> Any:
@@ -381,7 +384,9 @@ async def test_sandbox_writer_logs_warning_when_notification_fails(monkeypatch):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
 
-    async def _fake_sandbox_with_injected_tools(*, sandbox_name: Any = None) -> Any:
+    async def _fake_sandbox_with_injected_tools(
+        *, sandbox_name: Any = None, sandbox: Any = None
+    ) -> Any:
         return SimpleNamespace(_tools_user=None, _tools_default_user=None)
 
     async def _fake_exec_scalar_request(*args: Any, **kwargs: Any) -> Any:
@@ -439,8 +444,10 @@ async def test_sandbox_writer_logs_warning_when_notification_fails(monkeypatch):
 
 
 @skip_if_no_mcp_package
+@pytest.mark.parametrize("explicit", [False, True])
 async def test_sandbox_client_runs_cli_as_tools_user_and_sends_default_user(
     monkeypatch,
+    explicit: bool,
 ):
     from mcp import StdioServerParameters
 
@@ -449,9 +456,14 @@ async def test_sandbox_client_runs_cli_as_tools_user_and_sends_default_user(
 
     default_user = SandboxDefaultUser(uid=1111, gid=1111, groups=[1111], home="/h")
     calls: list[dict[str, Any]] = []
+    environment = SimpleNamespace(_tools_user="root", _tools_default_user=default_user)
 
-    async def _fake_sandbox_with_injected_tools(*, sandbox_name: Any = None) -> Any:
-        return SimpleNamespace(_tools_user="root", _tools_default_user=default_user)
+    async def _fake_sandbox_with_injected_tools(
+        *, sandbox_name: Any = None, sandbox: Any = None
+    ) -> Any:
+        assert sandbox_name is None
+        assert sandbox is (environment if explicit else None)
+        return environment
 
     async def _recording_exec_scalar_request(*args: Any, **kwargs: Any) -> Any:
         calls.append(kwargs)
@@ -465,16 +477,41 @@ async def test_sandbox_client_runs_cli_as_tools_user_and_sends_default_user(
         sandbox_module, "exec_scalar_request", _recording_exec_scalar_request
     )
 
-    async with sandbox_module.sandbox_client(StdioServerParameters(command="fake")) as (
-        _read_stream,
-        write_stream,
-    ):
+    async with sandbox_module.sandbox_client(
+        StdioServerParameters(command="fake"),
+        sandbox_environment=environment if explicit else None,
+    ) as (_read_stream, write_stream):
         await write_stream.aclose()
 
     launch, kill = calls
     assert launch["method"] == "mcp_launch_server"
     assert launch["params"]["user"] == default_user._asdict()
     assert [c["user"] for c in (launch, kill)] == ["root", "root"]
+
+
+@skip_if_no_mcp_package
+def test_mcp_sandbox_factory_passes_explicit_environment(monkeypatch):
+    from inspect_ai.tool import mcp_server_sandbox
+    from inspect_ai.tool._mcp import _local
+
+    environment = MagicMock(spec=SandboxEnvironment)
+    captured = {}
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return environment
+
+    monkeypatch.setattr(_local, "create_server_sandbox", create)
+    assert (
+        mcp_server_sandbox(command="server", sandbox_environment=environment)
+        is environment
+    )
+    assert captured["sandbox_environment"] is environment
+    assert captured["sandbox"] is None
+    with pytest.raises(ValueError, match="not both"):
+        mcp_server_sandbox(
+            command="server", sandbox="named", sandbox_environment=environment
+        )
 
 
 @skip_if_no_mcp_package

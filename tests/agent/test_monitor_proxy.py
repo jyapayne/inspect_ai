@@ -64,6 +64,20 @@ async def test_monitor_proxy_success() -> None:
     await _monitor_proxy(proc)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("events", [[ExecCompleted(exit_code=0)], []])
+async def test_raw_monitor_requires_a_live_proxy(events: list[ExecOutput]) -> None:
+    with pytest.raises(RuntimeError, match="unexpectedly"):
+        await _monitor_proxy(FakeProcess(events), True)  # type: ignore[arg-type]
+
+
+async def test_raw_monitor_allows_owned_shutdown() -> None:
+    closing = anyio.Event()
+    closing.set()
+    await _monitor_proxy(
+        FakeProcess([ExecCompleted(exit_code=0)]), True, closing  # type: ignore[arg-type]
+    )
+
+
 # ============================================================================
 # The bridge's polls of its proxy, against a sandbox that answers them
 # ============================================================================

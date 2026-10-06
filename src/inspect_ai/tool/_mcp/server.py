@@ -4,6 +4,7 @@ from typing import Literal
 
 from inspect_ai._util.error import pip_dependency_error
 from inspect_ai._util.version import verify_required_version
+from inspect_ai.util._sandbox.environment import SandboxEnvironment
 
 from ._config import MCPServerConfigHTTP
 from ._remote import MCPServerRemote
@@ -158,6 +159,7 @@ def mcp_server_sandbox(
     cwd: str | Path | None = None,
     env: dict[str, str] | None = None,
     sandbox: str | None = None,
+    sandbox_environment: SandboxEnvironment | None = None,
     timeout: int | None = None,
 ) -> MCPServer:
     """MCP Server (Sandbox).
@@ -174,11 +176,15 @@ def mcp_server_sandbox(
             "SHELL", "TERM", and "USER" for Posix-based systems).
         cwd: The working directory to use when spawning the process.
         sandbox: The sandbox to use when spawning the process.
+        sandbox_environment: Explicit sandbox transport for callers outside an
+            Inspect execution context. Mutually exclusive with ``sandbox``.
         timeout: Timeout (in seconds) for command.
 
     Returns:
         McpClient: Client for MCP Server
     """
+    if sandbox is not None and sandbox_environment is not None:
+        raise ValueError("Specify a sandbox name or an explicit sandbox, not both")
     verfify_mcp_package()
     from ._local import create_server_sandbox
 
@@ -189,6 +195,7 @@ def mcp_server_sandbox(
         cwd=cwd,
         env=env,
         sandbox=sandbox,
+        sandbox_environment=sandbox_environment,
         timeout=timeout,
     )
 

@@ -4,12 +4,14 @@ End-to-end process for shipping a new version of the sandbox tools executables.
 
 ## Overview
 
-The sandbox tools are compiled into portable static Linux executables (amd64 + arm64) and distributed via:
+The sandbox tools are compressed PyInstaller `--onedir` Linux bundles for matching architecture/libc variants (amd64/arm64 × glibc/musl), not standalone static ELF files. Each contains a launcher and its `_internal` runtime sidecars; injection must preserve the entire extracted tree. They are distributed via:
 
 1. **S3** — runtime downloads for editable/dev installs
 2. **PyPI** — bundled into the `inspect_ai` wheel for pip installs
 
 The version is a simple integer in `src/inspect_ai/tool/_sandbox_tools_utils/sandbox_tools_version.txt`.
+
+The fork additionally selects `sandbox_tools_fork_revision.txt` and `-v{VERSION}-tl{N}` artifact names. Its default runtime distribution is the rolling GitHub `sandbox-tools` release configured in `sandbox.py`; `INSPECT_SANDBOX_TOOLS_BASE_URL` can override that URL. The S3 commands below describe the upstream publication flow. Never overwrite an existing published asset with different bytes or relabel old bytes as a new build.
 
 ## Release Steps
 
@@ -121,3 +123,28 @@ The install state detection (`_get_install_state`) determines which tiers are at
 | `src/inspect_ai/tool/_sandbox_tools_utils/validate_distros.py` | Cross-distro validation |
 | `src/inspect_ai/tool/_sandbox_tools_utils/sandbox.py` | Runtime resolution and injection |
 | `scripts/pypi-release.py` | PyPI release script (downloads from S3) |
+
+## Optional RAW HTTP model bridge
+
+The public `inspect_ai.agent.sandbox_model_proxy(sandbox, methods=handlers, raw_http=True)` API reuses the released bridge service, without an Inspect Model or provider loop. Default model-aware bridges are unchanged. Raw mode requires exactly the following protocol-v1 handlers:
+
+- `raw_http_ready(version)` returns `{"version": 1}` after the listener binds.
+- `raw_http_start(version, method, path, headers, body_b64)` returns `version`, an opaque `response_id`, the actual HTTP `status`, and `headers`.
+- `raw_http_read(version, response_id)` returns `version`, `body_b64`, and boolean `eof`. Each decoded chunk is at most 65,536 bytes; the next read follows downstream drain.
+- `raw_http_close(version, response_id)` returns `version` and must be idempotent.
+
+Every successful RPC response carries integer `version=1`; an `error` field signals protocol/transport failure. Headers are ordered `[name, value]` pairs. Request entity bytes and the path/query are preserved; model JSON is not parsed. Request bodies retain the 50 MiB limit, ambiguous framing is rejected, and request trailers are unsupported. Response entity bytes, status and end-to-end header pairs (including duplicates) are preserved. Hop-by-hop headers, connection-nominated headers, trailers and transfer framing are removed or rebuilt; this is not preservation of upstream TCP/HTTP chunk boundaries. HEAD and no-body statuses retain their HTTP semantics. HTTP upgrades and WebSockets are unsupported.
+
+Before headers, transport failures return a local `raw_bridge_error` 502 (504 on timeout); malformed client requests return 400 (408 on timeout). After headers, a failed read closes without a terminal HTTP chunk, never fabricating a JSON/SSE error or success terminator. Known handles are closed on completion, disconnect, cancellation and failure. A disconnected start request retains its bounded RPC until its handle can be closed; host lease revocation must own cleanup when the service disappears or a handle is lost.
+
+The CLI uses legacy routes unless `BRIDGE_MODEL_SERVICE_RAW_HTTP_VERSION=1` is explicitly set. Any other value, including empty, fails startup. The public SDK first runs `model_proxy --capabilities` against the injected launcher and requires integer `raw_http_version=1`. It then starts the same model-proxy process with explicit protocol negotiation and waits up to 30 seconds for its bound-loopback ready handshake. The binary accepts no requests until that handshake succeeds. Ready/close RPC deadlines are 30 seconds; start/read deadlines are 660 seconds, so host upstream timeouts must fit within that bound. The SDK fails if the raw proxy exits, even with exit code zero.
+
+The host owns authorization, model allow-lists, provider credentials, tenant-header policy, redaction, limits and capabilities, including remote media, web, code execution and MCP. Raw mode does not mint Inspect proposal grants or apply Inspect approval/state semantics; `bridged_tools` and generate/tool handlers are refused. Hosts exposing MCP via raw routes must own their trusted execution grants.
+
+### Build and provenance gates
+
+An aligned SDK source/wheel and a compatible newly built bundle are separate prerequisites. Source version metadata stays authoritative; a version label is not evidence of raw capability. The existing injection path retains architecture/libc selection, framework-directory ownership checks, fork-revision checks and digest-verified downloads. The new capability query and live handshake reject an old binary even when its package-version label matches. They do not replace artifact provenance or make an agent-writable tools directory trusted.
+
+Build from the final recorded source using the normal Docker/PyInstaller build orchestrator after source freeze. A local single-variant build uses `--arch amd64` or `--arch arm64`, with `--musl` only for musl. The default selector builds `-dev`; edited installs select that name, whereas clean/package installs select non-dev. Never rename stale bytes to satisfy the selector, suppress dependencies, or invent digest entries. Preserve the entire extracted tree. Record the actual source commit, source-derived wheel version, wheel digest, bundle digest, architecture/libc and executable version independently. Publication requires the normal immutable asset/digest release procedure; building one local variant is not publication or coverage of the other three.
+
+Before handoff, verify the installed public SDK/default Inspect bridge, explicit external-sandbox MCP and bare/proxied remote exec. Run `tests/agent/test_sandbox_model_proxy.py`, `tests/agent/test_monitor_proxy.py`, `tests/tools/test_mcp_tools.py` and `tests/util/sandbox/test_exec_remote.py` with the normally resolved SDK. The sandbox-tools tests `tests/agent_bridge/test_raw_proxy.py` and `test_raw_http_consumer.py` cover raw transport, real SSE bytes, provider error statuses, header/body preservation, disconnect/backpressure and legacy mode. For an actual bundle smoke, set `INSPECT_RAW_HTTP_LAUNCHER` to its extracted launcher and `INSPECT_RAW_HTTP_IMAGE` to a matching Linux image with no `python`/`python3`; the consumer fixture keeps its mock gateway on the host. These are verification instructions, not claims that any gate has run on the aligned release.

@@ -234,12 +234,13 @@ async def sandbox_agent_bridge(
 async def _model_proxy_service(
     sandbox_env: SandboxEnvironment,
     methods: dict[str, SandboxServiceMethod],
-    bridge: SandboxAgentBridge,
+    bridge: SandboxAgentBridge | None,
     *,
     port: int,
     polling_interval: float | None,
     caller: str,
     poll_timeout_recovery: float | None = None,
+    raw_http: bool = False,
 ) -> AsyncIterator[None]:
     """Run the in-sandbox model proxy against `methods` for the duration of the block.
 
@@ -259,6 +260,7 @@ async def _model_proxy_service(
     # Track whether the block completed successfully. If so, cleanup errors
     # should be logged but not cause the sample to fail.
     block_completed = False
+    closing = anyio.Event()
 
     try:
         async with anyio.create_task_group() as tg:
@@ -288,12 +290,17 @@ async def _model_proxy_service(
                         f"{MODEL_SERVICE.upper()}_PORT": str(port),
                         f"{MODEL_SERVICE.upper()}_INSTANCE": instance,
                         **(
+                            {"BRIDGE_MODEL_SERVICE_RAW_HTTP_VERSION": "1"}
+                            if raw_http
+                            else {}
+                        ),
+                        **(
                             {
                                 "BRIDGE_MODEL_EVENT_METADATA_HEADERS": ",".join(
                                     sorted(bridge.model_event_metadata_headers)
                                 )
                             }
-                            if bridge.model_event_metadata_headers
+                            if bridge is not None and bridge.model_event_metadata_headers
                             else {}
                         ),
                     },
@@ -303,18 +310,21 @@ async def _model_proxy_service(
             )
 
             # monitor proxy for unexpected death
-            tg.start_soon(_monitor_proxy, proxy)
+            tg.start_soon(_monitor_proxy, proxy, raw_http, closing)
 
             # monitor for a sample failure requested from the service task
             # (approver termination, fail_on_refusal, a host tool that raised)
-            tg.start_soon(_monitor_failure, bridge)
+            if bridge is not None:
+                tg.start_soon(_monitor_failure, bridge)
 
             # the caller's block
             try:
                 yield
                 block_completed = True
             finally:
-                bridge.close_conversation_spans()
+                closing.set()
+                if bridge is not None:
+                    bridge.close_conversation_spans()
                 with anyio.CancelScope(shield=True):
                     # ensure the process terminates (no-op if already dead)
                     await proxy.kill()
@@ -387,7 +397,11 @@ async def _monitor_failure(bridge: SandboxAgentBridge) -> None:
     )
 
 
-async def _monitor_proxy(proxy: ExecRemoteProcess) -> None:
+async def _monitor_proxy(
+    proxy: ExecRemoteProcess,
+    require_running: bool = False,
+    closing: anyio.Event | None = None,
+) -> None:
     """Monitor the proxy process event stream and raise if it dies unexpectedly."""
     stderr: list[str] = []
     async for event in proxy:
@@ -395,6 +409,8 @@ async def _monitor_proxy(proxy: ExecRemoteProcess) -> None:
             stderr.append(event.data)
             logger.debug("model_proxy stderr: %s", event.data.rstrip())
         if isinstance(event, ExecCompleted):
+            if require_running and closing is not None and closing.is_set():
+                return
             if not event.success:
                 raise RuntimeError(
                     f"Model proxy process exited unexpectedly with failure: {''.join(stderr)}."
@@ -404,3 +420,7 @@ async def _monitor_proxy(proxy: ExecRemoteProcess) -> None:
                     "model_proxy stderr output on clean exit:\n%s",
                     "".join(stderr).rstrip(),
                 )
+            if require_running:
+                raise RuntimeError("Raw HTTP model proxy process exited unexpectedly.")
+    if require_running and (closing is None or not closing.is_set()):
+        raise RuntimeError("Raw HTTP model proxy event stream ended unexpectedly.")

@@ -86,7 +86,12 @@ def main() -> None:
         case "server":
             server_main()
         case "model_proxy":
-            asyncio.run(run_model_proxy_server())
+            if args.capabilities:
+                from inspect_sandbox_tools._agent_bridge.raw import RAW_HTTP_VERSION
+
+                print(json.dumps({"raw_http_version": RAW_HTTP_VERSION}))
+            else:
+                asyncio.run(run_model_proxy_server())
 
 
 def start_server() -> None:
@@ -416,7 +421,7 @@ def _server_process_metadata() -> dict[str, int | float] | None:
         created_at = metadata["created_at"]
     except (FileNotFoundError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
-    if not isinstance(pid, int) or not isinstance(created_at, int | float):
+    if type(pid) is not int or pid <= 0 or type(created_at) not in (int, float):
         return None
     return {"pid": pid, "created_at": created_at}
 
@@ -432,7 +437,15 @@ def _parse_args() -> argparse.Namespace:
     subparsers.add_parser("stop-server")
     subparsers.add_parser("server")
     subparsers.add_parser("healthcheck")
-    subparsers.add_parser("model_proxy")
+    model_proxy_parser = subparsers.add_parser(
+        "model_proxy",
+        help="Run the model bridge (RAW HTTP opt-in: BRIDGE_MODEL_SERVICE_RAW_HTTP_VERSION=1)",
+    )
+    model_proxy_parser.add_argument(
+        "--capabilities",
+        action="store_true",
+        help="Print supported raw HTTP protocol version without starting the proxy",
+    )
 
     return parser.parse_args()
 

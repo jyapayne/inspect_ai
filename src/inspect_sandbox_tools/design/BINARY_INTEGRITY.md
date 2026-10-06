@@ -1,7 +1,40 @@
 # Verifying sandbox-tools binaries against digests pinned in git
 
-Design for meridianlabs-ai/inspect_ai#283. Status: implemented in the same
-PR as this design.
+Design background for meridianlabs-ai/inspect_ai#283. The current fork-specific
+contract below supersedes the historical rollout and soft-launch proposals in
+the remainder of this document.
+
+## Current artifact and runtime contract
+
+- Artifacts are compressed tar archives of PyInstaller `--onedir` trees, not
+  standalone static ELF files. Preserve the launcher and `_internal` sidecars
+  together. The digest covers the archive bytes, not just the launcher.
+- Fork names include `-v{VERSION}-tl{N}` (and `-dev` for local development),
+  architecture and optional `-musl`. Record the bundle digest and executable
+  `version` RPC alongside source provenance. Injection checks the fork's `tl.N`
+  metadata. Track the host SDK wheel separately: host-only fixes do not change
+  bundle bytes, and a package version does not prove raw capability.
+- Runtime downloads use the URL configured by `sandbox.py` (the fork default
+  is a rolling GitHub release, not upstream S3). Missing pinned digests and
+  mismatched digests are fatal; the historical soft-launch switch below no
+  longer describes runtime behavior. Missing objects may lead to a local build,
+  but integrity failures cannot.
+- Existing local artifacts are not rehashed at injection. A filename, selector
+  or package-version label cannot establish freshness or source provenance.
+  New bundle code must go through the real immutable artifact revision and
+  digest process; never overwrite a published revision/URL with changed bytes.
+  A local build is not publication or validation of other architecture/libc
+  variants, and a new local digest is not a receipt for an existing release.
+- Raw embeddings additionally require the selected launcher's
+  `model_proxy --capabilities` response and post-bind
+  `raw_http_ready(version=1)` handshake. The public `sandbox_model_proxy` raw
+  mode enforces both. Integrity checks alone cannot prove protocol support.
+- Framework-directory ownership and tools-user checks still apply. Capability
+  negotiation does not make agent-writable binaries trusted or supply model
+  authorization, credentials, proposal grants or Inspect model semantics.
+
+See [Releasing sandbox tools](RELEASING.md) for build selectors and the
+[raw protocol](RELEASING.md#optional-raw-http-model-bridge).
 
 ## Problem
 

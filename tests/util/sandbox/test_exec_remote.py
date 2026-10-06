@@ -15,13 +15,17 @@ import anyio
 import pytest
 import tenacity
 from tenacity.wait import wait_none
+from test_helpers.sandbox import CannedSandbox
 from test_helpers.utils import skip_if_no_docker
 
 import inspect_ai.util._sandbox.exec_remote as exec_remote_module
+from inspect_ai.event._sandbox import SandboxEvent
+from inspect_ai.log._transcript import Transcript, init_transcript, transcript
 from inspect_ai.tool._sandbox_tools_utils.sandbox import (
     SandboxInjectionError,
     _inject_container_tools_code,
 )
+from inspect_ai.util._sandbox._cli import SANDBOX_CLI
 from inspect_ai.util._sandbox.docker.docker import DockerSandboxEnvironment
 from inspect_ai.util._sandbox.environment import SandboxDefaultUser
 from inspect_ai.util._sandbox.events import (
@@ -185,6 +189,44 @@ def _make_scripted_sandbox(script: list[str | Exception]) -> AsyncMock:
 
     sandbox.exec = AsyncMock(side_effect=fake_exec)
     return sandbox
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+async def test_remote_poll_supports_bare_sandbox_and_preserves_proxy_events(
+    wrapped: bool,
+) -> None:
+    responses = iter(
+        [
+            _start_response(),
+            _poll_response(stdout="output", stderr="diagnostic", exit_code=7, seq=1),
+            "ordinary command output",
+        ]
+    )
+    bare = CannedSandbox(
+        lambda _cmd, _user: ExecResult(
+            success=True, returncode=0, stdout=next(responses), stderr=""
+        )
+    )
+    assert not hasattr(bare, "no_events")
+    sandbox = SandboxEnvironmentProxy(bare) if wrapped else bare
+    previous = transcript()
+    recorded = Transcript()
+    init_transcript(recorded)
+    try:
+        process = await exec_remote_streaming(sandbox, ["command"], 5)
+        assert [event async for event in process] == [
+            ExecStdout(data="output"),
+            ExecStderr(data="diagnostic"),
+            ExecCompleted(exit_code=7),
+        ]
+        # Polling is quiet; ordinary proxy commands still record events afterward.
+        await sandbox.exec(["after-poll"])
+        events = [event for event in recorded.events if isinstance(event, SandboxEvent)]
+        assert [event.cmd for event in events] == (
+            [f"{SANDBOX_CLI} exec", "after-poll"] if wrapped else []
+        )
+    finally:
+        init_transcript(previous)
 
 
 # ============================================================================

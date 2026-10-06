@@ -9,8 +9,9 @@ from __future__ import annotations
 import logging
 import shlex
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, ClassVar, Literal, TypeVar, Union, cast
+from typing import TYPE_CHECKING, ClassVar, Literal, TypeVar, Union
 
 import anyio
 from pydantic import BaseModel
@@ -475,8 +476,12 @@ class ExecRemoteProcess:
             if retried_repoll_error is not None and self._killed:
                 raise retried_repoll_error
 
-            sandbox_proxy = cast(SandboxEnvironmentProxy, self._transport.sandbox)
-            with sandbox_proxy.no_events():
+            sandbox = self._transport.sandbox
+            with (
+                sandbox.no_events()
+                if isinstance(sandbox, SandboxEnvironmentProxy)
+                else nullcontext()
+            ):
                 result = await self._rpc(
                     "exec_remote_poll",
                     {"pid": self._pid, "ack_seq": self._last_seq},

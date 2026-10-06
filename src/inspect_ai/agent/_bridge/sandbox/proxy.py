@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from logging import getLogger
 from typing import AsyncIterator, cast
 
+import anyio
 from pydantic import JsonValue
 
 from inspect_ai.tool._mcp._config import MCPServerConfigHTTP
@@ -13,6 +14,7 @@ from inspect_ai.tool._sandbox_tools_utils.sandbox import sandbox_with_injected_t
 from inspect_ai.tool._tool_call import ToolCall
 from inspect_ai.tool._tool_info import ToolInfo
 from inspect_ai.util._limit import LimitExceededError
+from inspect_ai.util._sandbox._cli import SANDBOX_CLI
 from inspect_ai.util._sandbox.environment import SandboxEnvironment
 from inspect_ai.util._sandbox.service import SandboxServiceMethod
 
@@ -34,6 +36,13 @@ _GENERATE_METHODS = {
     "generate_google": "the Google Gemini API",
 }
 _TOOL_METHODS = ("list_tools", "call_tool")
+_RAW_HTTP_METHODS = (
+    "raw_http_ready",
+    "raw_http_start",
+    "raw_http_read",
+    "raw_http_close",
+)
+_RAW_HTTP_START_TIMEOUT = 30
 
 
 @dataclass(frozen=True)
@@ -73,6 +82,7 @@ async def sandbox_model_proxy(
     port: int = 13131,
     bridged_tools: Sequence[BridgedToolsSpec] | None = None,
     polling_interval: float | None = None,
+    raw_http: bool = False,
 ) -> AsyncIterator[ModelProxy]:
     """Run the agent bridge's in-sandbox model proxy with caller-supplied handlers.
 
@@ -184,6 +194,19 @@ async def sandbox_model_proxy(
         polling_interval: Seconds between the host's polls of the sandbox for
             requests. Defaults to the sandbox's own default (0.2 for Docker, 2
             otherwise); a smaller value is raised to that default.
+        raw_http: Opt in to byte-preserving HTTP transport, not model generation.
+            Requires exactly the four ``raw_http_ready``, ``raw_http_start``,
+            ``raw_http_read`` and ``raw_http_close`` handlers implementing raw
+            protocol v1, and a matching sandbox-tools binary. In this mode none
+            of the generate-handler transformations documented above apply:
+            response status, end-to-end header pairs and entity bytes (including
+            real SSE chunks) pass through without provider parsing. Transfer
+            framing is rebuilt. The host owns authorization, credentials, model
+            policy and tool grants, including any MCP routes. ``bridged_tools``
+            and generate/tool handlers are refused rather than silently ignored.
+            Checks the selected binary's capability before starting the proxy
+            and waits up to 30 seconds for its bound-loopback v1 handshake before
+            yielding. No Inspect Model or agent state is constructed.
 
     Yields:
         The running proxy, stopped when the block exits.
@@ -195,7 +218,45 @@ async def sandbox_model_proxy(
         TypeError: A value in `methods` is not callable.
         RuntimeError: The proxy process exits while the block runs.
     """
-    _validate_methods(methods, bridged_tools)
+    _validate_methods(methods, bridged_tools, raw_http=raw_http)
+
+    if raw_http:
+        sandbox_env = await sandbox_with_injected_tools(sandbox=sandbox)
+        await _require_raw_http(sandbox_env)
+        ready = anyio.Event()
+
+        async def raw_ready(*, version: JsonValue) -> JsonValue:
+            if type(version) is not int or version != 1:
+                raise RuntimeError("Unsupported raw HTTP proxy protocol")
+            result = await methods["raw_http_ready"](version=version)
+            if (
+                not isinstance(result, dict)
+                or type(result.get("version")) is not int
+                or result["version"] != 1
+                or "error" in result
+            ):
+                raise RuntimeError("Host rejected raw HTTP proxy protocol v1")
+            ready.set()
+            return result
+
+        async with _model_proxy_service(
+            sandbox_env,
+            {**methods, "raw_http_ready": raw_ready},
+            None,
+            port=port,
+            polling_interval=polling_interval,
+            caller="sandbox_model_proxy",
+            raw_http=True,
+        ):
+            try:
+                with anyio.fail_after(_RAW_HTTP_START_TIMEOUT):
+                    await ready.wait()
+            except TimeoutError as ex:
+                raise RuntimeError(
+                    "Sandbox tools did not acknowledge raw HTTP protocol v1"
+                ) from ex
+            yield ModelProxy(port=port)
+        return
 
     # execution grant bookkeeping for bridged tools, and the channel through
     # which a failing host tool fails the block (`SandboxAgentBridge.request_fail`)
@@ -236,8 +297,12 @@ async def sandbox_model_proxy(
 def _validate_methods(
     methods: Mapping[str, ModelProxyMethod],
     bridged_tools: Sequence[BridgedToolsSpec] | None,
+    *,
+    raw_http: bool = False,
 ) -> None:
-    supported = [*_GENERATE_METHODS, *_TOOL_METHODS]
+    supported = (
+        list(_RAW_HTTP_METHODS) if raw_http else [*_GENERATE_METHODS, *_TOOL_METHODS]
+    )
     unknown = sorted(name for name in methods if name not in supported)
     if unknown:
         raise ValueError(
@@ -247,6 +312,15 @@ def _validate_methods(
     for name, handler in methods.items():
         if not callable(handler):
             raise TypeError(f"Model proxy method '{name}' is not callable.")
+    if raw_http:
+        missing = sorted(name for name in _RAW_HTTP_METHODS if name not in methods)
+        if missing:
+            raise ValueError(f"Missing raw HTTP proxy method(s): {', '.join(missing)}.")
+        if bridged_tools:
+            raise ValueError(
+                "Raw HTTP hosts must own tool grants; bridged_tools is not supported."
+            )
+        return
     tool_methods = [name for name in _TOOL_METHODS if name in methods]
     if tool_methods and bridged_tools:
         raise ValueError(
@@ -258,6 +332,29 @@ def _validate_methods(
         raise ValueError(
             f"Model proxy method '{tool_methods[0]}' needs its counterpart: pass "
             "both list_tools and call_tool, or neither."
+        )
+
+
+async def _require_raw_http(sandbox: SandboxEnvironment) -> None:
+    """Require a capability of the installed binary, not a source/version label."""
+    result = await sandbox.exec(
+        [SANDBOX_CLI, "model_proxy", "--capabilities"],
+        user=sandbox._tools_user,
+        timeout=30,
+    )
+    try:
+        capabilities = json.loads(result.stdout) if result.success else None
+    except json.JSONDecodeError:
+        capabilities = None
+    if (
+        not isinstance(capabilities, dict)
+        or type(capabilities.get("raw_http_version")) is not int
+        or capabilities["raw_http_version"] != 1
+    ):
+        raise RuntimeError(
+            "The installed sandbox-tools bundle does not support raw HTTP v1. "
+            "Build and install the complete bundle from the aligned SDK source; "
+            "a matching package version alone is insufficient."
         )
 
 

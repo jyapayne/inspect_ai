@@ -292,3 +292,5 @@ filesystem_server = mcp_server_sandbox(
 ```
 
 This will look for the MCP server in the default sandbox (you can also specify an explicit `sandbox` option if it is located in another sandbox).
+
+Outside an Inspect sample, pass an explicit public `SandboxEnvironment` as `sandbox_environment=environment`. This binds the MCP transport and tools-user identity to that environment without looking up sample-local sandbox state. `sandbox` (a name) and `sandbox_environment` are mutually exclusive. Existing named/default sandbox callers, MCP timeouts and shutdown behavior are unchanged.
