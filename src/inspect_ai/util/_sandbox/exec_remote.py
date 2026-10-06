@@ -9,8 +9,9 @@ from __future__ import annotations
 import logging
 import shlex
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, ClassVar, Literal, TypeVar, Union, cast
+from typing import TYPE_CHECKING, ClassVar, Literal, TypeVar, Union
 
 import anyio
 from pydantic import BaseModel
@@ -282,7 +283,8 @@ class ExecRemoteProcess:
         """Initialize an ExecRemoteProcess.
 
         Args:
-            sandbox: The sandbox environment where the process will run.
+            sandbox: The sandbox environment where the process will run. Direct
+                environments do not need transcript/event proxy methods.
             cmd: Command and arguments to execute.
             options: Execution options.
             sandbox_default_poll_interval: Default poll interval in seconds,
@@ -476,8 +478,12 @@ class ExecRemoteProcess:
         async def poll() -> _PollResult:
             from inspect_ai.util._sandbox.events import SandboxEnvironmentProxy
 
-            sandbox_proxy = cast(SandboxEnvironmentProxy, self._transport.sandbox)
-            with sandbox_proxy.no_events():
+            sandbox = self._transport.sandbox
+            with (
+                sandbox.no_events()
+                if isinstance(sandbox, SandboxEnvironmentProxy)
+                else nullcontext()
+            ):
                 result = await self._rpc(
                     "exec_remote_poll",
                     {"pid": self._pid, "ack_seq": self._last_seq},

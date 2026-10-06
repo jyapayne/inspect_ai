@@ -2367,8 +2367,16 @@ async def run_model_proxy_server() -> None:
     # determine port
     port = int(os.getenv("BRIDGE_MODEL_SERVICE_PORT", "13131"))
 
-    # Create server
-    server = await model_proxy_server(port)
+    # RAW is an explicit protocol negotiation, never an implicit route fallback.
+    raw_version = os.environ.get("BRIDGE_MODEL_SERVICE_RAW_HTTP_VERSION")
+    if raw_version is None:
+        server = await model_proxy_server(port)
+    else:
+        from inspect_sandbox_tools._agent_bridge.raw import raw_http_proxy_server
+
+        if raw_version != "1":
+            raise ValueError(f"Unsupported RAW HTTP bridge version: {raw_version!r}")
+        server = await raw_http_proxy_server(port)
 
     # Run server
     try:
@@ -2400,7 +2408,7 @@ def _handle_model_proxy_error(ex: Exception) -> None:
     sys.stderr.flush()
 
 
-async def _call_bridge_model_service_async(method: str, **params: Any) -> Any:
+async def _call_bridge_model_service_async(method: str, /, **params: Any) -> Any:
     from asyncio import sleep
 
     request_id = _write_bridge_model_service_request(method, **params)
@@ -2411,7 +2419,7 @@ async def _call_bridge_model_service_async(method: str, **params: Any) -> Any:
             return result
 
 
-def _write_bridge_model_service_request(method: str, **params: Any) -> str:
+def _write_bridge_model_service_request(method: str, /, **params: Any) -> str:
     from json import dump
     from uuid import uuid4
 

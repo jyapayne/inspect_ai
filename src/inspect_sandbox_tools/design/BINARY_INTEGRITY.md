@@ -1,7 +1,37 @@
 # Verifying sandbox-tools binaries against digests pinned in git
 
-Design for meridianlabs-ai/inspect_ai#283. Status: implemented in the same
-PR as this design.
+Design background for meridianlabs-ai/inspect_ai#283. The current fork-specific
+contract below supersedes the historical rollout and soft-launch proposals in
+the remainder of this document.
+
+## Current artifact and runtime contract
+
+- Artifacts are compressed tar archives of PyInstaller `--onedir` trees, not
+  standalone static ELF files. Preserve the launcher and `_internal` runtime
+  sidecars together. The digest covers the archive bytes, not just the launcher.
+- Fork artifact names include `-v{VERSION}-tl{N}` (and `-dev` for local development),
+  with architecture and optional `-musl` selecting the target. Record the bundle
+  digest and executable `version` RPC alongside source provenance; injection
+  checks the fork's `tl.N` package build metadata. Track the host SDK checkout or
+  wheel separately: a host-only compatibility fix need not change bundle bytes.
+- Runtime downloads use the distribution URL configured by `sandbox.py` (the
+  fork default is a rolling GitHub release, not the upstream S3 bucket).
+  Missing pinned digests and digest mismatches are fatal; the historical
+  `INSPECT_SANDBOX_TOOLS_STRICT_DIGESTS` soft-launch switch below no longer
+  describes runtime behavior. Missing remote objects can fall through to a
+  local build, but integrity failures cannot.
+- Existing local artifacts are not rehashed at injection. Install-state
+  selection and a matching filename do not establish freshness, provenance, or
+  raw HTTP capability. A local build is not a public release, and validation of
+  one architecture/libc variant is not validation of all variants.
+- Raw HTTP embeddings must additionally require the post-bind
+  `raw_http_ready(version=1)` handshake. Neither archive integrity nor the
+  executable's package version alone proves this protocol is available.
+
+See [Releasing sandbox tools](RELEASING.md) for source builds and selector
+requirements, and its [raw protocol section](RELEASING.md#optional-raw-http-model-bridge)
+for host policy and resource ownership. These checks do not supply provider
+authorization, credential handling, or Inspect model semantics.
 
 ## Problem
 

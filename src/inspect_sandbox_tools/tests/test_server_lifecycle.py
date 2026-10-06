@@ -513,6 +513,50 @@ def test_server_process_metadata_refuses_symlinked_pid_file(
         main_module._server_process_metadata()
 
 
+@pytest.mark.parametrize(
+    "pid,created_at",
+    [
+        (True, 1.0),
+        (False, 1.0),
+        (0, 1.0),
+        (-1, 1.0),
+        (123.0, 1.0),
+        ("123", 1.0),
+        (123, True),
+        (123, "1.0"),
+        (None, 1.0),
+    ],
+)
+def test_invalid_server_pid_metadata_never_inspects_or_signals_a_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, pid: Any, created_at: Any
+) -> None:
+    pid_path = tmp_path / "server.pid"
+    pid_path.write_text(json.dumps({"pid": pid, "created_at": created_at}))
+    monkeypatch.setattr(main_module, "SERVER_PID_PATH", pid_path)
+
+    def unexpected_process(pid: int) -> Any:
+        pytest.fail(f"Invalid metadata reached process lookup: {pid!r}")
+
+    monkeypatch.setattr(psutil, "Process", unexpected_process)
+    assert not main_module._server_process_is_running()
+    main_module._terminate_unresponsive_server()
+
+
+@pytest.mark.parametrize("same_process", [True, False])
+def test_server_pid_metadata_retains_creation_time_identity_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, same_process: bool
+) -> None:
+    pid = os.getpid()
+    created_at = psutil.Process(pid).create_time()
+    pid_path = tmp_path / "server.pid"
+    pid_path.write_text(
+        json.dumps({"pid": pid, "created_at": created_at if same_process else 0.0})
+    )
+    monkeypatch.setattr(main_module, "SERVER_PID_PATH", pid_path)
+
+    assert main_module._server_process_is_running() is same_process
+
+
 class _PlantedSymlink(NamedTuple):
     link: Path
     target: Path

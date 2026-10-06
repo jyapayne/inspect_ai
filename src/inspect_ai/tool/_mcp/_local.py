@@ -37,6 +37,7 @@ from inspect_ai.tool._tool import Tool, ToolError, ToolParsingError, ToolResult
 from inspect_ai.tool._tool_def import ToolDef
 from inspect_ai.tool._tool_params import ToolParams
 from inspect_ai.util._anyio import inner_exception
+from inspect_ai.util._sandbox.environment import SandboxEnvironment
 
 from ._compat import (
     MCP_READ_TIMEOUT_CODES,
@@ -551,6 +552,7 @@ def create_server_sandbox(
     env: dict[str, str] | None = None,
     sandbox: str | None = None,
     timeout: int | None = None,
+    sandbox_environment: SandboxEnvironment | None = None,
 ) -> MCPServer:
     # Normalize the default once so the in-sandbox transport timeout and the
     # host-side MCP read timeout share one effective value. Passing the raw
@@ -570,6 +572,7 @@ def create_server_sandbox(
             ),
             sandbox_name=sandbox,
             timeout=effective_timeout,
+            sandbox_environment=sandbox_environment,
         ),
         name=name,
         events=False,

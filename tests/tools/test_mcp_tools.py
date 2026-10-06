@@ -265,7 +265,7 @@ def _patch_sandbox_module(monkeypatch, exec_model_request_impl):
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             pass
 
-    async def _fake_sandbox_with_injected_tools(*, sandbox_name: Any = None) -> Any:
+    async def _fake_sandbox_with_injected_tools(*, sandbox_name: Any = None, sandbox: Any = None) -> Any:
         return SimpleNamespace(_tools_user=None, _tools_default_user=None)
 
     async def _fake_exec_scalar_request(*args: Any, **kwargs: Any) -> Any:
@@ -449,9 +449,12 @@ async def test_sandbox_client_runs_cli_as_tools_user_and_sends_default_user(
 
     default_user = SandboxDefaultUser(uid=1111, gid=1111, groups=[1111], home="/h")
     calls: list[dict[str, Any]] = []
+    explicit_sandbox = SimpleNamespace(_tools_user="root", _tools_default_user=default_user)
 
-    async def _fake_sandbox_with_injected_tools(*, sandbox_name: Any = None) -> Any:
-        return SimpleNamespace(_tools_user="root", _tools_default_user=default_user)
+    async def _fake_sandbox_with_injected_tools(*, sandbox_name: Any = None, sandbox: Any = None) -> Any:
+        assert sandbox is explicit_sandbox
+        assert sandbox_name is None
+        return explicit_sandbox
 
     async def _recording_exec_scalar_request(*args: Any, **kwargs: Any) -> Any:
         calls.append(kwargs)
@@ -465,10 +468,9 @@ async def test_sandbox_client_runs_cli_as_tools_user_and_sends_default_user(
         sandbox_module, "exec_scalar_request", _recording_exec_scalar_request
     )
 
-    async with sandbox_module.sandbox_client(StdioServerParameters(command="fake")) as (
-        _read_stream,
-        write_stream,
-    ):
+    async with sandbox_module.sandbox_client(
+        StdioServerParameters(command="fake"), sandbox_environment=explicit_sandbox
+    ) as (_read_stream, write_stream):
         await write_stream.aclose()
 
     launch, kill = calls

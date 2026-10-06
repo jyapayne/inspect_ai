@@ -274,39 +274,42 @@ async def test_model_proxy_request_headers_and_body(
 
 
 @pytest.mark.asyncio
-async def test_model_proxy_forwards_client_headers_to_model_service() -> None:
-    calls: list[tuple[str, dict[str, Any]]] = []
+@pytest.mark.parametrize("parallel_tool_calls", [None, True, False])
+async def test_model_proxy_forwards_headers_and_preserves_legacy_tool_policy(
+    parallel_tool_calls: bool | None,
+) -> None:
+    forwarded_headers: dict[str, str] = {}
+    forwarded_body: dict[str, Any] = {}
 
-    async def call_model_service(method: str, **params: Any) -> dict[str, str]:
-        calls.append((method, params))
-        return {"id": "completion"}
-
-    server = await model_proxy_server(
-        port=0,
-        call_bridge_model_service_async=call_model_service,
-    )
-    handler = server.routes["POST"]["/v1/chat/completions"]
-
-    await handler(
-        {
-            "json": {"model": "inspect", "messages": []},
-            "headers": {"x-claude-code-agent-id": "toolu_x"},
+    async def call_model_service(
+        method: str,
+        json_data: dict[str, Any],
+        headers: dict[str, str] | None = None,
+        metadata_headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        forwarded_headers.update(headers or {})
+        forwarded_body.update(json_data)
+        return {
+            "id": "completion",
+            "choices": [{"message": {"role": "assistant", "content": "service reply"}}],
         }
-    )
 
-    assert calls == [
-        (
-            "generate_completions",
-            {
-                "json_data": {
-                    "model": "inspect",
-                    "messages": [],
-                    "parallel_tool_calls": False,
-                },
-                "headers": {"x-claude-code-agent-id": "toolu_x"},
-            },
-        )
-    ]
+    body: dict[str, Any] = {"model": "inspect", "messages": []}
+    if parallel_tool_calls is not None:
+        body["parallel_tool_calls"] = parallel_tool_calls
+    async with _proxy_with_service(call_model_service) as base_url:
+        async with ClientSession() as session:
+            async with session.post(
+                f"{base_url}/v1/chat/completions",
+                json=body,
+                headers={"x-claude-code-agent-id": "toolu_x"},
+            ) as response:
+                assert response.status == 200
+                result = await response.json()
+                assert result["choices"][0]["message"]["content"] == "service reply"
+
+    assert forwarded_headers["x-claude-code-agent-id"] == "toolu_x"
+    assert forwarded_body["parallel_tool_calls"] is False
 
 
 @pytest.mark.asyncio
@@ -729,6 +732,7 @@ async def proxy_server() -> AsyncGenerator[tuple[AsyncHTTPServer, str], None]:
         method: str,
         json_data: dict[str, Any],
         headers: dict[str, str] | None = None,
+        metadata_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Mock implementation of call_bridge_model_service_async."""
         if method == "generate_responses":
@@ -1599,6 +1603,7 @@ async def proxy_server_anthropic() -> AsyncGenerator[tuple[AsyncHTTPServer, str]
         method: str,
         json_data: dict[str, Any],
         headers: dict[str, str] | None = None,
+        metadata_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Mock implementation of call_bridge_model_service_async for Anthropic."""
         if method == "generate_anthropic":
@@ -2308,6 +2313,7 @@ async def proxy_server_google() -> AsyncGenerator[tuple[AsyncHTTPServer, str], N
         method: str,
         json_data: dict[str, Any],
         headers: dict[str, str] | None = None,
+        metadata_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Mock implementation of call_bridge_model_service_async for Google."""
         if method == "generate_google":

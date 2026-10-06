@@ -312,6 +312,16 @@ def _identity_parity(check_root: bool = True) -> Solver:
         assert isinstance(result, list) and isinstance(result[0], ContentText), result
         assert " ".join(result[0].text.split()) == expected, result
 
+        # The same binary and identity boundary are available to managed hosts
+        # that hold an explicit sandbox instead of an Inspect execution context.
+        async with mcp_server_sandbox(
+            command="python3", args=["/tmp/mini_mcp.py"], sandbox_environment=sb
+        ) as srv:
+            [whoami] = await srv.tools()
+            explicit_result = await whoami()
+        assert isinstance(explicit_result, list) and isinstance(explicit_result[0], ContentText)
+        assert " ".join(explicit_result[0].text.split()) == expected
+
         if not check_root:
             return state
 
